@@ -2,7 +2,11 @@ import { isAbsolute, relative, resolve } from "node:path";
 import type { InboundMessage } from "../contracts/events.js";
 
 export function conversationScope(message: InboundMessage): string {
-  return `${message.chatId}:${message.senderOpenId}`;
+  return operatorScope(message.chatId, message.senderOpenId);
+}
+
+export function operatorScope(chatId: string, operatorOpenId: string): string {
+  return `${chatId}:${operatorOpenId}`;
 }
 
 export function isPathInside(candidate: string, root: string): boolean {

@@ -14,5 +14,8 @@ describe("Windows 静默启动脚本", () => {
     expect(output.vbs).toContain("shell.Run");
     expect(output.vbs).toContain(", 0, True");
     expect(output.vbs).toContain("-WindowStyle Hidden");
+    expect(output.runner).toContain("$ErrorActionPreference = 'Continue'");
+    expect(output.runner).toContain("$serviceExitCode = $LASTEXITCODE");
+    expect(output.vbs).toContain("WScript.Quit exitCode");
   });
 });

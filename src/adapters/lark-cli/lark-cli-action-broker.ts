@@ -110,7 +110,8 @@ function successSummary(action: LarkAction, envelope: CliEnvelope): string {
 export class LarkCliActionBroker implements ActionBroker {
   public constructor(
     private readonly command: string,
-    private readonly prefixArgs: readonly string[] = []
+    private readonly prefixArgs: readonly string[] = [],
+    private readonly timeoutMs = 60_000
   ) {}
 
   public async execute(
@@ -162,16 +163,32 @@ export class LarkCliActionBroker implements ActionBroker {
       });
       let stdout = "";
       let stderr = "";
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, this.timeoutMs);
+      timeout.unref();
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
       child.stdout.on("data", (part: string) => {
-        stdout += part;
+        stdout = `${stdout}${part}`.slice(-1_000_000);
       });
       child.stderr.on("data", (part: string) => {
-        stderr += part;
+        stderr = `${stderr}${part}`.slice(-64_000);
       });
-      child.once("error", reject);
-      child.once("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+      child.once("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once("close", (code) => {
+        clearTimeout(timeout);
+        resolve({
+          code: timedOut ? 124 : (code ?? 1),
+          stdout,
+          stderr: timedOut ? "lark-cli 执行超时。" : stderr
+        });
+      });
       child.stdin.end(spec.stdin ?? "", "utf8");
     });
   }

@@ -7,4 +7,5 @@ export interface CodingAgent {
   ): Promise<ExecutionResult>;
   cancel(scopeKey: string): boolean;
   activeScopes(): readonly string[];
+  shutdown(graceMs: number): Promise<void>;
 }

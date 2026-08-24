@@ -24,7 +24,20 @@ describe("CodexExecAgent", () => {
       `let prompt = "";
 process.stdin.setEncoding("utf8");
 for await (const chunk of process.stdin) prompt += chunk;
-const resumed = process.argv.includes("resume");
+const argv = process.argv.slice(2);
+const resumed = argv.includes("resume");
+if (prompt === "busy") {
+  console.error("failed to acquire session write lock: another process is using it");
+  process.exit(2);
+}
+if (resumed && argv.indexOf("--color") > argv.indexOf("resume")) {
+  console.error("--color must be placed before resume");
+  process.exit(2);
+}
+if (!argv.includes("--sandbox") || !argv.includes("workspace-write")) {
+  console.error("sandbox option is required");
+  process.exit(2);
+}
 console.log(JSON.stringify({type:"thread.started", thread_id: resumed ? "existing" : "new-session"}));
 console.log(JSON.stringify({type:"item.completed", item:{type:"agent_message", text:"reply:" + prompt}}));
 `,
@@ -71,5 +84,22 @@ console.log(JSON.stringify({type:"item.completed", item:{type:"agent_message", t
     );
     expect(result.sessionId).toBe("existing");
     expect(result.finalText).toBe("reply:again");
+  });
+
+  it("把 Codex 原生 session 锁冲突转换成可理解的错误", async () => {
+    const agent = new CodexExecAgent(process.execPath, logger, [fakeCli]);
+    await expect(
+      agent.run(
+        {
+          scopeKey: "scope",
+          prompt: "busy",
+          cwd: directory,
+          sessionId: "existing",
+          sandbox: "workspace-write",
+          timeoutMs: 5_000
+        },
+        async () => undefined
+      )
+    ).rejects.toThrow("另一个入口使用");
   });
 });

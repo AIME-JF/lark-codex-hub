@@ -8,14 +8,21 @@ import type {
 import type { CodingAgent } from "../../ports/coding-agent.js";
 import type { Logger } from "../../observability/logger.js";
 import { parseCodexLine } from "./jsonl-parser.js";
+import {
+  ExecutionTimeoutError,
+  SessionBusyError,
+  isNativeSessionBusyMessage
+} from "../../domain/execution-errors.js";
 
 interface ActiveRun {
   child: ChildProcessWithoutNullStreams;
-  cancelled: boolean;
+  stopReason?: "cancelled" | "timeout" | "shutdown";
+  exited: boolean;
 }
 
 export class CodexExecAgent implements CodingAgent {
   private readonly active = new Map<string, ActiveRun>();
+  private closing = false;
 
   public constructor(
     private readonly command: string,
@@ -32,15 +39,31 @@ export class CodexExecAgent implements CodingAgent {
     if (!run) {
       return false;
     }
-    run.cancelled = true;
-    run.child.kill("SIGTERM");
+    this.terminate(run, "cancelled");
     return true;
+  }
+
+  public async shutdown(graceMs: number): Promise<void> {
+    this.closing = true;
+    for (const run of this.active.values()) {
+      this.terminate(run, "shutdown");
+    }
+    const deadline = Date.now() + graceMs;
+    while (this.active.size > 0 && Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    for (const run of this.active.values()) {
+      this.forceTerminate(run);
+    }
   }
 
   public async run(
     request: ExecutionRequest,
     onEvent: (event: ExecutionEvent) => Promise<void>
   ): Promise<ExecutionResult> {
+    if (this.closing) {
+      throw new Error("Codex 运行器正在关闭，暂不接受新任务。");
+    }
     if (this.active.has(request.scopeKey)) {
       throw new Error("该会话已有 Codex 任务正在执行。");
     }
@@ -52,7 +75,7 @@ export class CodexExecAgent implements CodingAgent {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true
     });
-    const active: ActiveRun = { child, cancelled: false };
+    const active: ActiveRun = { child, exited: false };
     this.active.set(request.scopeKey, active);
     let stderr = "";
     let sessionId = request.sessionId;
@@ -78,7 +101,7 @@ export class CodexExecAgent implements CodingAgent {
 
     const timeout = setTimeout(() => {
       this.logger.warn("Codex 执行超时，正在终止", { scopeKey: request.scopeKey });
-      child.kill("SIGTERM");
+      this.terminate(active, "timeout");
     }, request.timeoutMs);
     timeout.unref();
 
@@ -87,18 +110,29 @@ export class CodexExecAgent implements CodingAgent {
     try {
       const exitCode = await new Promise<number>((resolve, reject) => {
         child.once("error", reject);
-        child.once("close", (code) => resolve(code ?? 1));
+        child.once("close", (code) => {
+          active.exited = true;
+          resolve(code ?? 1);
+        });
       });
       await eventQueue;
-      if (exitCode !== 0 && !active.cancelled) {
+      if (active.stopReason === "timeout") {
+        throw new ExecutionTimeoutError();
+      }
+      if (exitCode !== 0 && !active.stopReason) {
         const detail = stderr.trim() || "Codex 未返回错误详情。";
+        if (isNativeSessionBusyMessage(detail)) {
+          throw new SessionBusyError();
+        }
         throw new Error(`Codex 退出码 ${exitCode}：${detail}`);
       }
+      const cancelled = Boolean(active.stopReason);
       return {
         ...(sessionId ? { sessionId } : {}),
-        finalText: active.cancelled ? "任务已取消。" : finalText,
+        finalText: cancelled ? "任务已取消。" : finalText,
         exitCode,
-        durationMs: Date.now() - startedAt
+        durationMs: Date.now() - startedAt,
+        cancelled
       };
     } finally {
       clearTimeout(timeout);
@@ -107,22 +141,50 @@ export class CodexExecAgent implements CodingAgent {
     }
   }
 
+  private terminate(
+    run: ActiveRun,
+    reason: "cancelled" | "timeout" | "shutdown"
+  ): void {
+    run.stopReason ??= reason;
+    run.child.kill("SIGTERM");
+    const force = setTimeout(() => this.forceTerminate(run), 2_000);
+    force.unref();
+  }
+
+  private forceTerminate(run: ActiveRun): void {
+    if (run.exited || run.child.pid === undefined) {
+      return;
+    }
+    if (process.platform === "win32") {
+      const killer = spawn(
+        "taskkill.exe",
+        ["/PID", String(run.child.pid), "/T", "/F"],
+        { stdio: "ignore", windowsHide: true }
+      );
+      killer.once("error", () => undefined);
+      return;
+    }
+    run.child.kill("SIGKILL");
+  }
+
   private arguments(request: ExecutionRequest): string[] {
-    const common = ["--json", "--color", "never", "-c", 'approval_policy="never"'];
-    if (request.model) {
-      common.push("--model", request.model);
-    }
-    if (request.sessionId) {
-      return ["exec", "resume", ...common, request.sessionId, "-"];
-    }
-    return [
-      "exec",
-      ...common,
+    const execOptions = [
+      "--json",
+      "--color",
+      "never",
+      "-c",
+      'approval_policy="never"',
       "--sandbox",
       request.sandbox,
       "--cd",
-      request.cwd,
-      "-"
+      request.cwd
     ];
+    if (request.model) {
+      execOptions.push("--model", request.model);
+    }
+    if (request.sessionId) {
+      return ["exec", ...execOptions, "resume", request.sessionId, "-"];
+    }
+    return ["exec", ...execOptions, "-"];
   }
 }

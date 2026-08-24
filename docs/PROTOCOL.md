@@ -36,3 +36,9 @@ Each action is validated before command arguments are produced. No action contai
 ## Card actions
 
 Approval cards use schema `2.0` and contain a pending-action ID. Callback events are deduplicated before processing. A callback replaces the complete card with a terminal success, failure, or rejection card; it does not perform partial mutation.
+
+The pending action is bound to its initiating operator Open ID, chat ID, and conversation scope. Confirmation atomically changes its state from `pending` to `executing`; repeated callbacks or `/confirm` commands cannot execute it twice. A pending action inherited from an older schema is marked `interrupted` during migration because it has no trustworthy ownership binding.
+
+## Delivery idempotency
+
+Inbound event IDs and message IDs are unique in SQLite. Replies and proactive sends use a durable idempotency key, and their Feishu UUID is deterministically derived from that key plus the continuation-card index. A retry after process loss therefore addresses the same remote request. Card updates are naturally repeatable because they replace the complete card.

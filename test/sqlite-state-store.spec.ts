@@ -62,17 +62,32 @@ describe("SqliteStateStore", () => {
     ).toBe(true);
     expect(store.nextOutbox(3, 10)).toHaveLength(1);
 
+    store.saveActiveReaction({
+      trackerId: "run-1",
+      messageId: "message-1",
+      reactionId: "reaction-1",
+      emoji: "THINKING",
+      updatedAt: 4
+    });
+    expect(store.getActiveReaction("run-1")?.emoji).toBe("THINKING");
+    expect(store.listActiveReactions()).toHaveLength(1);
+    store.clearActiveReaction("run-1");
+    expect(store.getActiveReaction("run-1")).toBeUndefined();
+
     store.savePendingAction(
       {
         id: "action-1",
         idempotencyKey: "key-1",
         actionJson: "{}",
-        confirmationJson: "{}"
+        confirmationJson: "{}",
+        operatorOpenId: "owner",
+        chatId: "chat",
+        scopeKey: "scope"
       },
-      4
+      5
     );
     expect(store.getPendingAction("action-1")?.idempotencyKey).toBe("key-1");
-    store.finishAction("action-1", "rejected", 5);
+    store.finishAction("action-1", "rejected", 6);
     expect(store.getPendingAction("action-1")).toBeUndefined();
   });
 });

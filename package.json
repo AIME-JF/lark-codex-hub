@@ -1,6 +1,6 @@
 {
   "name": "@aime-jf/lark-codex-hub",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A secure Feishu control plane for Codex CLI",
   "type": "module",
   "private": false,
@@ -15,14 +15,21 @@
     "dist",
     "README.md",
     "README.zh-CN.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "ARCHITECTURE.md",
+    "docs"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "check": "npm run typecheck && npm test && npm run build",
+    "check:release": "npm run check && npm run test:coverage && npm audit --audit-level=high",
+    "prepack": "npm run check",
     "start": "node ./dist/cli/index.js start",
     "doctor": "node ./dist/cli/index.js doctor"
   },

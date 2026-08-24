@@ -15,7 +15,9 @@ Do not open a public issue containing credentials, tokens, message content, or l
 - Codex runs with `workspace-write` or `read-only`; unrestricted sandbox mode is not exposed.
 - Child processes are spawned without a shell.
 - `lark-cli` actions are discriminated schemas, not arbitrary argument arrays.
-- Risk confirmations are durable and idempotent.
+- Risk confirmations are durable, atomically claimed, and bound to the initiating operator, chat, and scope.
+- Workspace allowlists are enforced after real-path resolution, including Windows Junctions.
+- Feishu delivery UUIDs are derived from non-secret idempotency keys to prevent duplicate replies after restart.
 - Logs recursively redact fields whose names resemble secrets, tokens, authorization data, passwords, or App IDs.
 - App credentials are encrypted with Windows DPAPI for the current user.
 

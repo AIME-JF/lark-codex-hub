@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { FileConfigStore } from "../adapters/config/file-config.js";
@@ -19,7 +20,8 @@ import {
 import { startRuntime } from "../composition/runtime.js";
 import { runDoctor } from "./doctor.js";
 import { errorMessage } from "../observability/logger.js";
-import { isPathInside } from "../domain/scope.js";
+import { presentation } from "../application/presentation-factory.js";
+import { NodeWorkspaceResolver } from "../adapters/fs/node-workspace-resolver.js";
 
 const args = process.argv.slice(2);
 
@@ -47,7 +49,8 @@ async function setup(home: string): Promise<void> {
   let workspace: string | undefined;
   let allowedRoots: string[] | undefined;
 
-  if (hasFlag("--from-env")) {
+  const sourceFromEnv = hasFlag("--from-env");
+  if (sourceFromEnv) {
     appId = process.env.LARK_APP_ID;
     appSecret = process.env.LARK_APP_SECRET;
     ownerOpenId = flag("--owner");
@@ -74,41 +77,44 @@ async function setup(home: string): Promise<void> {
   const config = createDefaultConfig(ownerOpenId, workspacePath);
   if (allowedRoots && allowedRoots.length > 0) {
     config.workspace.allowedRoots = allowedRoots.map((item) => resolve(item));
-    const containsDefault = config.workspace.allowedRoots.some((root) =>
-      isPathInside(workspacePath, root)
+    await new NodeWorkspaceResolver().resolveAllowed(
+      workspacePath,
+      workspacePath,
+      config.workspace.allowedRoots
     );
-    if (!containsDefault) {
-      throw new Error("默认工作目录必须位于 --allow-root 范围内。");
-    }
   }
-  const vault = createSecretVault(home);
-  if (process.env.LARK_APP_ID && process.env.LARK_APP_SECRET) {
-    const savedAppId = process.env.LARK_APP_ID;
-    const savedAppSecret = process.env.LARK_APP_SECRET;
-    delete process.env.LARK_APP_ID;
-    delete process.env.LARK_APP_SECRET;
-    const persistentVault = createSecretVault(home);
-    await persistentVault.set("feishu.app_id", savedAppId);
-    await persistentVault.set("feishu.app_secret", savedAppSecret);
-  } else {
-    await vault.set("feishu.app_id", appId);
-    await vault.set("feishu.app_secret", appSecret);
-  }
+  delete process.env.LARK_APP_ID;
+  delete process.env.LARK_APP_SECRET;
+  const persistentVault = createSecretVault(home);
+  await persistentVault.set("feishu.app_id", appId);
+  await persistentVault.set("feishu.app_secret", appSecret);
   await new FileConfigStore(home).save(config);
   process.stdout.write(`配置完成。状态目录：${home}\n`);
 }
 
 async function start(home: string): Promise<void> {
   const runtime = await startRuntime(home);
+  const stopRequest = join(home, "shutdown.request");
   await new Promise<void>((resolveShutdown) => {
     let stopping = false;
+    let stopWatcher: NodeJS.Timeout;
     const shutdown = (): void => {
       if (stopping) {
         return;
       }
       stopping = true;
+      clearInterval(stopWatcher);
       void runtime.close().finally(resolveShutdown);
     };
+    stopWatcher = setInterval(() => {
+      void readFile(stopRequest, "utf8")
+        .then(async () => {
+          await rm(stopRequest, { force: true });
+          shutdown();
+        })
+        .catch(() => undefined);
+    }, 500);
+    stopWatcher.unref();
     process.once("SIGINT", shutdown);
     process.once("SIGTERM", shutdown);
   });
@@ -119,7 +125,7 @@ async function doctor(home: string): Promise<void> {
   for (const check of checks) {
     process.stdout.write(`${check.ok ? "✓" : "✗"} ${check.name}：${check.detail}\n`);
   }
-  if (checks.some((check) => !check.ok && check.name !== "静默启动")) {
+  if (checks.some((check) => !check.ok)) {
     process.exitCode = 1;
   }
 }
@@ -161,20 +167,45 @@ async function service(home: string): Promise<void> {
     return;
   }
   if (action === "remove") {
+    await stopService(home);
     await removeScheduledTask();
     process.stdout.write("静默启动计划任务已删除。\n");
     return;
   }
   if (action === "start") {
+    await rm(join(home, "shutdown.request"), { force: true });
     await startScheduledTask();
     process.stdout.write("已请求启动计划任务。\n");
+    return;
+  }
+  if (action === "stop") {
+    await stopService(home);
+    process.stdout.write("静默服务已停止。\n");
     return;
   }
   if (action === "status") {
     process.stdout.write(`${JSON.stringify(await scheduledTaskStatus(), null, 2)}\n`);
     return;
   }
-  throw new Error("用法：service install|remove|start|status");
+  throw new Error("用法：service install|remove|start|stop|status");
+}
+
+async function stopService(home: string): Promise<void> {
+  const initial = await scheduledTaskStatus();
+  if (!initial.installed || initial.state !== "Running") {
+    await rm(join(home, "shutdown.request"), { force: true });
+    return;
+  }
+  await writeFile(join(home, "shutdown.request"), `${Date.now()}\n`, "utf8");
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 250));
+    const current = await scheduledTaskStatus();
+    if (current.state !== "Running") {
+      return;
+    }
+  }
+  throw new Error("等待静默服务优雅停止超时，请检查 logs/hub.log。");
 }
 
 async function notify(home: string): Promise<void> {
@@ -183,14 +214,24 @@ async function notify(home: string): Promise<void> {
     throw new Error("notify 需要消息正文。");
   }
   const config = await new FileConfigStore(home).load();
+  if (!config.notifications.enabled) {
+    throw new Error("主动通知已在配置中关闭。");
+  }
   const store = new SqliteStateStore(openDatabase(join(home, "hub.sqlite")));
   store.migrate();
-  store.enqueueOutbox(
+  store.enqueueDelivery(
     {
       idempotencyKey: randomUUID(),
-      targetType: "open_id",
-      targetId: config.feishu.ownerOpenId,
-      text
+      target: {
+        kind: "send",
+        type: "open_id",
+        id: config.feishu.ownerOpenId
+      },
+      card: presentation(text, {
+        title: "Codex 主动通知",
+        kind: "notification",
+        status: "新通知"
+      })
     },
     Date.now()
   );
@@ -208,7 +249,7 @@ function usage(): void {
   lark-codex-hub doctor
   lark-codex-hub status
   lark-codex-hub notify <消息>
-  lark-codex-hub service install|remove|start|status
+  lark-codex-hub service install|remove|start|stop|status
 `);
 }
 

@@ -9,19 +9,28 @@ export interface AccessDecision {
 export class AccessPolicy {
   public constructor(private readonly config: HubConfig["feishu"]) {}
 
-  public decide(message: InboundMessage): AccessDecision {
+  public decideOperator(openId: string, chatId?: string): AccessDecision {
     const permittedUsers = new Set([
       this.config.ownerOpenId,
       ...this.config.allowedOpenIds
     ]);
-    if (!permittedUsers.has(message.senderOpenId)) {
+    if (!permittedUsers.has(openId)) {
       return { allowed: false, reason: "当前用户未获授权。" };
     }
     if (
+      chatId &&
       this.config.allowedChatIds.length > 0 &&
-      !this.config.allowedChatIds.includes(message.chatId)
+      !this.config.allowedChatIds.includes(chatId)
     ) {
       return { allowed: false, reason: "当前会话未在允许列表中。" };
+    }
+    return { allowed: true };
+  }
+
+  public decide(message: InboundMessage): AccessDecision {
+    const operator = this.decideOperator(message.senderOpenId, message.chatId);
+    if (!operator.allowed) {
+      return operator;
     }
     if (
       message.chatKind === "group" &&

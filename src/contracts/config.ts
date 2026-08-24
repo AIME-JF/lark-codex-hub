@@ -31,8 +31,22 @@ export const hubConfigSchema = z.object({
     enabled: z.boolean().default(true),
     maxAttempts: z.number().int().min(1).max(20).default(6)
   }),
+  presentation: z
+    .object({
+      cardsEnabled: z.boolean().default(true),
+      reactionsEnabled: z.boolean().default(true),
+      keepTerminalReaction: z.boolean().default(true)
+    })
+    .default({
+      cardsEnabled: true,
+      reactionsEnabled: true,
+      keepTerminalReaction: true
+    }),
   runtime: z.object({
     leaseSeconds: z.number().int().min(30).max(3600).default(180),
+    shutdownGraceSeconds: z.number().int().min(5).max(300).default(30),
+    logMaxMegabytes: z.number().int().min(1).max(100).default(10),
+    logRetentionFiles: z.number().int().min(1).max(20).default(5),
     logLevel: z.enum(["debug", "info", "warn", "error"]).default("info")
   })
 });
@@ -73,8 +87,16 @@ export function createDefaultConfig(ownerOpenId: string, workspaceRoot: string):
       enabled: true,
       maxAttempts: 6
     },
+    presentation: {
+      cardsEnabled: true,
+      reactionsEnabled: true,
+      keepTerminalReaction: true
+    },
     runtime: {
       leaseSeconds: 180,
+      shutdownGraceSeconds: 30,
+      logMaxMegabytes: 10,
+      logRetentionFiles: 5,
       logLevel: "info"
     }
   });

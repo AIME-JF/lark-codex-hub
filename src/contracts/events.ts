@@ -20,6 +20,13 @@ export interface InboundCardAction {
   receivedAt: number;
 }
 
+export interface InboundBotMenuAction {
+  eventId: string;
+  operatorOpenId: string;
+  eventKey: string;
+  receivedAt: number;
+}
+
 export interface ConversationLink {
   scopeKey: string;
   sessionId: string;
@@ -49,4 +56,5 @@ export interface ExecutionResult {
   finalText: string;
   exitCode: number;
   durationMs: number;
+  cancelled: boolean;
 }

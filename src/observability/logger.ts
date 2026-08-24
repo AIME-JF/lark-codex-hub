@@ -1,4 +1,11 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  statSync,
+  unlinkSync
+} from "node:fs";
 import { dirname } from "node:path";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -17,7 +24,13 @@ const levelRank: Record<LogLevel, number> = {
   error: 40
 };
 
-const secretPattern = /secret|token|authorization|password|app_id/i;
+const secretPattern = /secret|token|authorization|password|app[_-]?id/i;
+
+function redactString(value: string): string {
+  return value
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer [REDACTED]")
+    .replace(/\b(cli_[A-Za-z0-9_-]{12,})\b/gu, "[REDACTED_APP_ID]");
+}
 
 function redact(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -31,13 +44,47 @@ function redact(value: unknown): unknown {
       ])
     );
   }
-  return value;
+  return typeof value === "string" ? redactString(value) : value;
 }
 
-export function createLogger(level: LogLevel, logFile?: string): Logger {
+export interface LoggerOptions {
+  console?: boolean;
+  maxBytes?: number;
+  retentionFiles?: number;
+}
+
+export function createLogger(
+  level: LogLevel,
+  logFile?: string,
+  options: LoggerOptions = {}
+): Logger {
+  const writeConsole = options.console ?? true;
+  const maxBytes = options.maxBytes ?? 10 * 1024 * 1024;
+  const retentionFiles = options.retentionFiles ?? 5;
+  let currentSize = 0;
   if (logFile) {
     mkdirSync(dirname(logFile), { recursive: true });
+    currentSize = existsSync(logFile) ? statSync(logFile).size : 0;
   }
+
+  const rotate = (): void => {
+    if (!logFile || !existsSync(logFile)) {
+      currentSize = 0;
+      return;
+    }
+    const oldest = `${logFile}.${retentionFiles}`;
+    if (existsSync(oldest)) {
+      unlinkSync(oldest);
+    }
+    for (let index = retentionFiles - 1; index >= 1; index -= 1) {
+      const source = `${logFile}.${index}`;
+      if (existsSync(source)) {
+        renameSync(source, `${logFile}.${index + 1}`);
+      }
+    }
+    renameSync(logFile, `${logFile}.1`);
+    currentSize = 0;
+  };
 
   const write = (entryLevel: LogLevel, message: string, fields?: Record<string, unknown>): void => {
     if (levelRank[entryLevel] < levelRank[level]) {
@@ -46,16 +93,24 @@ export function createLogger(level: LogLevel, logFile?: string): Logger {
     const line = JSON.stringify({
       time: new Date().toISOString(),
       level: entryLevel,
-      message,
+      message: redactString(message),
       ...(fields ? { fields: redact(fields) } : {})
     });
-    if (entryLevel === "error") {
-      process.stderr.write(`${line}\n`);
-    } else {
-      process.stdout.write(`${line}\n`);
+    if (writeConsole) {
+      if (entryLevel === "error") {
+        process.stderr.write(`${line}\n`);
+      } else {
+        process.stdout.write(`${line}\n`);
+      }
     }
     if (logFile) {
-      appendFileSync(logFile, `${line}\n`, "utf8");
+      const output = `${line}\n`;
+      const bytes = Buffer.byteLength(output);
+      if (currentSize + bytes > maxBytes) {
+        rotate();
+      }
+      appendFileSync(logFile, output, "utf8");
+      currentSize += bytes;
     }
   };
 

@@ -1,0 +1,55 @@
+{
+  "name": "@aime-jf/lark-codex-hub",
+  "version": "1.0.0",
+  "description": "A secure Feishu control plane for Codex CLI",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "bin": {
+    "lark-codex-hub": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "check": "npm run typecheck && npm test && npm run build",
+    "start": "node ./dist/cli/index.js start",
+    "doctor": "node ./dist/cli/index.js doctor"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.73.0",
+    "better-sqlite3": "13.0.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "22.19.7",
+    "@vitest/coverage-v8": "^4.1.11",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AIME-JF/lark-codex-hub.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AIME-JF/lark-codex-hub/issues"
+  },
+  "homepage": "https://github.com/AIME-JF/lark-codex-hub#readme",
+  "keywords": [
+    "codex",
+    "feishu",
+    "lark",
+    "remote-agent"
+  ]
+}

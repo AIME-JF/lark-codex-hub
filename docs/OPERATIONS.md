@@ -1,22 +1,48 @@
-# Operations
+# 运维手册
 
-## State layout
+本文面向已经完成安装的使用者，说明服务启停、诊断、升级、备份、恢复和卸载。首次安装请从[主 README](../README.md)开始。
 
-The default state directory is `%USERPROFILE%\.lark-codex-hub`:
+## 服务生命周期
 
-```text
-config.v2.json          non-secret configuration
-secrets.v2.json         current-user DPAPI-encrypted credentials
-hub.sqlite*             sessions, queues, leases, runs, and approvals
-logs/hub.log*           rotating structured runtime logs
-service-launcher.v2.*   silent startup launchers
+所有命令都在项目目录中执行：
+
+```powershell
+# 安装或刷新静默计划任务
+node .\dist\cli\index.js service install
+
+# 启动
+node .\dist\cli\index.js service start
+
+# 查看状态
+node .\dist\cli\index.js service status
+
+# 优雅停止
+node .\dist\cli\index.js service stop
+
+# 停止并删除计划任务
+node .\dist\cli\index.js service remove
 ```
 
-Set `LARK_CODEX_HUB_HOME` to use an isolated state directory. Never commit this directory.
+`service stop` 会写入本地停止请求。运行时收到请求后依次停止接收新事件、取消活动 Codex 进程树、等待当前处理器和投递器收尾，最后关闭 SQLite。正常停止后，计划任务上次结果应为 `0`。
 
-## Diagnostics
+## 状态目录
 
-Run commands from the installed project directory:
+默认目录为 `%USERPROFILE%\.lark-codex-hub`。可通过 `LARK_CODEX_HUB_HOME` 使用隔离目录。
+
+```text
+config.v2.json          非敏感配置、白名单和运行参数
+secrets.v2.json         当前用户 DPAPI 加密的飞书凭据
+hub.sqlite              SQLite 主数据库
+hub.sqlite-wal          WAL 日志，服务运行时可能存在
+hub.sqlite-shm          WAL 共享内存，服务运行时可能存在
+logs/hub.log*           轮转后的结构化运行日志
+logs/service.log        静默启动器的原生错误输出
+service-launcher.v2.*   PowerShell 和 VBS 隐藏窗口启动器
+```
+
+不要将该目录加入 Git、同步到公开网盘或作为 Issue 附件上传。
+
+## 诊断
 
 ```powershell
 node .\dist\cli\index.js doctor
@@ -24,9 +50,34 @@ node .\dist\cli\index.js status
 node .\dist\cli\index.js service status
 ```
 
-`doctor` validates the configuration, DPAPI credentials, real workspace path, Codex resume arguments, optional `lark-cli` identity, SQLite WAL/integrity, and Task Scheduler state. It never prints secret values.
+`doctor` 会检查：
 
-## Updating
+- `config.v2.json` 是否符合配置 Schema。
+- DPAPI 凭据是否能被当前 Windows 用户读取。
+- 默认工作目录的真实路径是否位于允许根目录内。
+- Codex CLI 版本及新建/恢复会话参数是否兼容。
+- 启用 `lark-cli` 时，机器人和用户身份是否可用。
+- SQLite schema、WAL 模式和 `integrity_check`。
+- Windows 计划任务是否正在运行。
+
+诊断不会输出 App Secret 或访问 Token。
+
+## 查看日志
+
+```powershell
+Get-Content "$env:USERPROFILE\.lark-codex-hub\logs\hub.log" -Tail 100
+```
+
+日志为每行一条 JSON，包含时间、级别、消息和结构化字段。文件按大小自动轮转，敏感字段和可识别的 Bearer/App ID 会被脱敏。
+
+只查看错误：
+
+```powershell
+Get-Content "$env:USERPROFILE\.lark-codex-hub\logs\hub.log" |
+  Select-String '"level":"error"'
+```
+
+## 升级
 
 ```powershell
 node .\dist\cli\index.js service stop
@@ -38,37 +89,107 @@ node .\dist\cli\index.js service start
 node .\dist\cli\index.js doctor
 ```
 
-`service stop` creates a local shutdown request. The runtime stops receiving events, cancels the active Codex process tree, drains current workers and delivery, and closes SQLite before Task Scheduler exits. Database migrations are transactional and run on the next command that opens state.
+注意事项：
 
-For an important workstation, copy `hub.sqlite`, `hub.sqlite-wal`, and `hub.sqlite-shm` only after `service stop`. DPAPI secrets can be restored only by the same Windows user on the same Windows installation.
+- 必须先优雅停止，避免构建期间删除正在使用的 `dist` 文件或复制不一致的数据库。
+- `npm ci` 按锁文件安装依赖，比保留旧依赖的 `npm install` 更适合升级。
+- 重新执行 `service install` 可以刷新 Node、项目目录和启动脚本路径。
+- SQLite 迁移在下次打开数据库时以事务执行。
 
-## Removing the service
+## 备份
+
+先停止服务，再复制整个状态目录：
+
+```powershell
+node .\dist\cli\index.js service stop
+Copy-Item "$env:USERPROFILE\.lark-codex-hub" `
+  "D:\backup\lark-codex-hub" -Recurse
+```
+
+如果只备份数据库，也应在停止后同时保留当时存在的 `hub.sqlite`、`hub.sqlite-wal` 和 `hub.sqlite-shm`。
+
+DPAPI 凭据只能由创建它们的 Windows 用户在原 Windows 安全上下文中解密。跨用户、跨系统或重装后恢复时，通常需要重新执行 `setup` 写入 App ID/App Secret。
+
+## 恢复语义
+
+服务异常退出后，下次启动会执行保守恢复：
+
+- 已进入本地投递队列的卡片会继续重试，并复用稳定幂等 UUID。
+- 处理中断的菜单和卡片事件会重新排队。
+- 处理中断的普通消息不会自动重跑，因为 Codex 可能已经修改文件。
+- `running` 的 Codex 记录和 `executing` 的飞书动作会标记为 `interrupted`。
+- 遗留的思考、执行或输入表情会尝试清理。
+- 资源租约过期后可以重新获得，不需要手工删除锁文件。
+
+如果 `doctor` 报告 SQLite 完整性不是 `ok`，请先停止服务并保存所有 `hub.sqlite*` 文件，再进行任何修复。
+
+## 与 Codex Desktop 共用 session
+
+Hub 会阻止自身不同飞书范围并发写入同一 Codex session；Codex Desktop 则使用 Codex 自身的原生会话锁。
+
+可以在两端查看同一 session，但不要同时发送任务。Desktop 占用时，机器人会提示另一个入口正在使用；等待任务完成后重试，或在飞书发送 `/new` 创建独立 session。
+
+## 卸载
+
+仅删除服务：
 
 ```powershell
 node .\dist\cli\index.js service remove
 ```
 
-Removal requests a graceful stop before unregistering the scheduled task. Delete the install directory afterwards. Delete `%USERPROFILE%\.lark-codex-hub` only when credentials, session history, queued deliveries, and logs are no longer needed.
+完整卸载步骤：
 
-## Recovery semantics
+1. 执行 `service remove`，确认计划任务已删除。
+2. 删除项目目录。
+3. 如果不再需要凭据、session、队列和日志，删除 `%USERPROFILE%\.lark-codex-hub`。
 
-- Delivery records are retried with bounded exponential backoff and stable Feishu request UUIDs.
-- A message interrupted during Codex execution is marked `interrupted` and is not automatically rerun because it may already have modified files.
-- Card and menu events interrupted before completion are requeued.
-- Running Codex records and executing Lark actions left by process loss become `interrupted`.
-- Stale thinking/working/typing reactions are removed at startup.
-- Expired resource leases can be acquired by a later process; no manual lock-file deletion is required.
+删除状态目录不可恢复，也会丢失 DPAPI 凭据和历史 session。
 
-If SQLite integrity is not `ok`, stop the service and preserve all three `hub.sqlite*` files before attempting repair.
+## 故障排查
 
-## Using the same session in Codex Desktop
+### 机器人完全没有回复
 
-The hub prevents concurrent writers inside its own process and across its SQLite scopes. Codex Desktop has its own native session lock. You may open the same session in both places, but do not send work from both at the same time. If Desktop owns the session, the bot reports that another entry is using it; wait for Desktop to finish and retry. Use `/new` in Feishu if you want an independent session.
+1. 运行 `doctor`。
+2. 确认计划任务为 `Running`。
+3. 查看 `logs\hub.log` 是否出现“飞书长连接已就绪”。
+4. 确认飞书应用版本已经发布，使用者位于可用范围。
+5. 核对 `im.message.receive_v1` 和消息权限。
 
-## Troubleshooting
+### 机器人回复“当前会话正忙”
 
-- No bot response: run `doctor`, then inspect the newest entries in `logs/hub.log` and confirm the scheduled task is `Running`.
-- Menu does nothing: verify `application.bot.menu_v6`, exact `hub_*` event keys, and that the latest app version is published.
-- Cards work but buttons do not: add the `card.action.trigger` callback and publish the app version.
-- No progress reactions: grant `im:message.reactions:write_only` and publish the permission change.
-- Repeated busy response: check whether Codex Desktop is still using that session; stale hub leases expire automatically.
+- 检查 Codex Desktop 是否正在使用同一 session。
+- 检查是否刚刚发送了另一条仍在处理的飞书消息。
+- Hub 租约有过期机制；服务异常退出后无需删除文件锁。
+
+### 快捷菜单没有反应
+
+- 事件键必须使用 `hub_help`、`hub_cancel`、`hub_new`、`hub_status`、`hub_sessions`、`hub_workspace`。
+- 应用必须订阅 `application.bot.menu_v6`。
+- 菜单修改后必须重新发布版本。
+
+### 卡片按钮没有反应
+
+- 应用必须订阅 `card.action.trigger`。
+- 只有原发起人能在原聊天/会话范围内确认操作。
+- 已处理、重复点击或服务异常中断的确认不会再次执行。
+
+### 没有进度表情
+
+- 检查 `im:message.reactions:write_only`。
+- 检查 `presentation.reactionsEnabled` 是否为 `true`。
+- 权限修改后重新发布应用版本。
+
+### 开机出现 CMD 窗口
+
+- 重新运行 `service install`，确保任务动作使用 `wscript.exe` 和隐藏 VBS 启动器。
+- 删除自己添加的 `.bat`、启动文件夹快捷方式或旧计划任务，避免重复启动。
+- 使用项目提供的 `LarkCodexHub` 计划任务，不要直接把 `node ... start` 放入开机启动。
+
+### 服务反复退出
+
+1. 查看 `logs\hub.log` 和 `logs\service.log`。
+2. 运行 `doctor`，重点检查 Codex、`lark-cli` 和工作目录。
+3. 如果不使用 `lark-cli`，将 `larkCli.enabled` 设置为 `false`。
+4. 执行 `npm ci` 和 `npm run check` 后重新安装计划任务。
+
+飞书后台问题参阅[飞书配置指南](FEISHU_SETUP.md)。

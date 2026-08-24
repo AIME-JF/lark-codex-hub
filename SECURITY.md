@@ -1,24 +1,64 @@
-# Security Policy
+# 安全政策
 
-## Supported version
+## 支持范围
 
-Only the latest release receives security fixes.
+只有最新发布版本接收安全修复。请先确认问题在 `main` 分支或最新版本中仍然存在。
 
-## Reporting
+## 报告漏洞
 
-Do not open a public issue containing credentials, tokens, message content, or local paths. Contact the repository owner privately and include only the minimum reproduction data.
+不要在公开 Issue、Discussion、PR、日志或截图中提交以下内容：
 
-## Security model
+- App ID/App Secret、访问 Token、授权头或设备授权码。
+- 真实用户 Open ID、聊天 ID、消息 ID 或消息正文。
+- 本机用户名、绝对路径、数据库、DPAPI 密钥文件或完整日志。
+- 可以直接触发文件修改、权限绕过或消息代发的利用细节。
 
-- Access is denied unless the sender matches the configured owner or allowlist.
-- Workspaces are resolved and checked against explicit root directories.
-- Codex runs with `workspace-write` or `read-only`; unrestricted sandbox mode is not exposed.
-- Child processes are spawned without a shell.
-- `lark-cli` actions are discriminated schemas, not arbitrary argument arrays.
-- Risk confirmations are durable, atomically claimed, and bound to the initiating operator, chat, and scope.
-- Workspace allowlists are enforced after real-path resolution, including Windows Junctions.
-- Feishu delivery UUIDs are derived from non-secret idempotency keys to prevent duplicate replies after restart.
-- Logs recursively redact fields whose names resemble secrets, tokens, authorization data, passwords, or App IDs.
-- App credentials are encrypted with Windows DPAPI for the current user.
+请通过仓库所有者提供的私下联系方式报告，并只包含复现所需的最少信息。报告建议包含：
 
-Review `config.v2.json` before adding chat or user allowlists. Never commit `.env`, `secrets.v2.json`, SQLite files, or logs.
+1. 受影响版本或提交。
+2. 问题类型和潜在影响。
+3. 使用虚构 ID 与脱敏路径的最小复现步骤。
+4. 预期行为与实际行为。
+5. 如果已有修复建议，可附不包含敏感数据的补丁。
+
+在修复发布前，请不要公开完整利用方法。
+
+## 威胁模型
+
+项目假设：
+
+- Windows 用户账户和本机管理员边界可信。
+- 飞书应用凭据只由当前安装者持有。
+- Codex CLI 已由当前 Windows 用户完成合法认证。
+- 配置允许的工作目录确实可以交由 Codex 修改。
+
+项目不用于抵御：
+
+- 已取得当前 Windows 用户或管理员权限的本机攻击者。
+- 被完全接管的飞书租户、开放平台应用或 Codex 账户。
+- 多个不互信用户共享同一 Windows 账户和同一状态目录。
+
+## 安全机制
+
+- 访问默认失败关闭，只有 owner、用户白名单和聊天白名单能够放行。
+- 群聊默认必须明确提及机器人。
+- 工作目录在真实路径解析后检查，阻止符号链接和 Windows Junction 逃逸。
+- Codex 仅暴露 `read-only` 和 `workspace-write`，不提供 `danger-full-access`。
+- 子进程不通过 shell 启动。
+- 飞书动作使用判别联合 Schema，不接受任意 `lark-cli` 参数。
+- 高风险确认绑定 operator、chat 和 scope，并使用原子状态领取。
+- 消息和卡片通过稳定幂等键避免异常重启后重复发送。
+- App 凭据使用当前用户 Windows DPAPI 加密。
+- 日志递归脱敏 secret、token、authorization、password 和 App ID 字段。
+- 数据库使用事务、WAL、唯一约束和完整性检查。
+
+## 使用者责任
+
+- 只将必要用户和聊天加入白名单。
+- 将 `allowedRoots` 限制到确实需要操作的项目目录。
+- 不使用包含生产密钥、个人隐私或不可恢复数据的目录做首次测试。
+- 定期运行 `doctor`、升级依赖并检查日志。
+- 在飞书后台按最小权限原则配置 scope。
+- 不向公开渠道上传 `%USERPROFILE%\.lark-codex-hub`。
+
+完整实现边界见[架构说明](ARCHITECTURE.md)。

@@ -25,4 +25,4 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Duplicate event processing, result loss after restart, stale reaction state, and permanent lock conflicts.
 - Schema 3 to schema 4 migration while preserving session and run history.
 
-[1.1.0]: https://github.com/AIME-JF/lark-codex-hub/releases/tag/v1.1.0
+[1.1.0]: https://github.com/AIME-JF/lark-codex-hub/commit/67f144ae40bb57a2ae0d2b09debad217d61961b4

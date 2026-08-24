@@ -1,14 +1,84 @@
-# Contributing
+# 贡献指南
 
-Contributions should preserve the port-and-adapter boundary and fail-closed security defaults.
+感谢你改进 Lark Codex Hub。提交前请先阅读[架构说明](ARCHITECTURE.md)和[安全政策](SECURITY.md)。
 
-Before opening a pull request:
+## 开发环境
 
-```bash
-npm install
+- Windows 10/11。
+- Node.js 22.12 或更高版本。
+- Git。
+- 可选：用于本地集成验证的 Codex CLI、飞书测试应用和 `lark-cli`。
+
+安装并验证：
+
+```powershell
+npm ci
 npm run check
 ```
 
-Do not add raw shell execution, raw `lark-cli` passthrough, plaintext credential storage, or a second definition of an existing contract. Add new Feishu actions to the central discriminated schema and map them in the action broker.
+发布级检查：
 
-Tests must use synthetic data. Never commit real Feishu IDs, tokens, message history, or workstation paths.
+```powershell
+npm run check:release
+```
+
+## 设计原则
+
+- 保持端口与适配器边界，应用层不得直接构造 SDK 客户端或外部进程参数。
+- 复用中心契约，避免在多个模块重复定义同一事件、动作或卡片类型。
+- 安全默认值失败关闭；扩权必须由显式配置完成。
+- 不增加 shell 执行、原始 `lark-cli` 透传或明文凭据存储。
+- 持久化状态必须定义崩溃恢复、重试和幂等行为。
+- 新飞书动作先加入中心动作 Schema，再由 `ActionBroker` 映射。
+- 用户可见错误应说明下一步，不能直接泄漏原始 Token、请求或本机敏感信息。
+
+## 修改流程
+
+1. 从最新 `main` 创建分支。
+2. 搜索现有契约和实现，避免增加重复逻辑。
+3. 只修改与问题相关的文件。
+4. 为行为变化增加或更新测试。
+5. 运行 `npm run check:release`。
+6. 检查 `git diff --check` 和待提交文件。
+7. 使用清晰的提交说明和 PR 描述。
+
+## 测试要求
+
+- 测试只能使用虚构 App ID、Open ID、chat ID、message ID、Token、消息和路径。
+- 不访问真实飞书聊天或修改真实云资源。
+- 文件系统测试使用临时目录。
+- 并发和恢复测试应验证数据库终态，而不只验证函数调用次数。
+- 适配器变更至少覆盖成功、可重试失败和不可恢复失败中的相关路径。
+
+## Pull Request
+
+PR 描述应包含：
+
+- 解决的问题和用户影响。
+- 主要设计选择及其安全/兼容性影响。
+- 新增、修改和删除的文件概览。
+- 已运行的检查及结果。
+- 手工验证步骤；截图必须完全脱敏。
+- 配置、数据库或飞书后台是否需要迁移。
+
+尽量让一个 PR 只解决一个主题。不要混入无关格式化或依赖升级。
+
+## 文档
+
+- 中文主入口为 `README.md`。
+- 完整英文入口为 `README.en.md`。
+- 飞书后台配置放在 `docs/FEISHU_SETUP.md`。
+- 运行维护与排错放在 `docs/OPERATIONS.md`。
+- 不在 README 复制深层实现细节；通过链接保持单一信息来源。
+
+## 敏感信息
+
+提交前搜索并删除：
+
+- `cli_`、`ou_`、`oc_`、`om_` 开头的真实 ID。
+- App Secret、访问 Token、Cookie 和授权 URL。
+- 用户姓名、租户名称、聊天内容和截图水印。
+- `%USERPROFILE%\.lark-codex-hub` 中的任何文件。
+- 数据库、日志、`.env` 和本机绝对路径。
+
+发现安全问题时不要创建公开 Issue，请按[安全政策](SECURITY.md)报告。

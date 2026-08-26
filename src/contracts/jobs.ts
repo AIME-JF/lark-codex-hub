@@ -33,6 +33,9 @@ export interface DeliveryRecord {
   attempts: number;
   trackerId?: string;
   terminalReaction?: TerminalReaction;
+  reactionTargets?: ReactionTarget[];
+  targetKey?: string;
+  revision?: number;
 }
 
 export interface DeliveryRequest {
@@ -41,4 +44,29 @@ export interface DeliveryRequest {
   card: PresentationCard;
   trackerId?: string;
   terminalReaction?: TerminalReaction;
+  reactionTargets?: ReactionTarget[];
+}
+
+export interface ReactionTarget {
+  trackerId: string;
+  messageId: string;
+}
+
+export type TurnJobState =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export interface TurnJobRecord {
+  id: string;
+  eventId: string;
+  scopeKey: string;
+  laneKey: string;
+  message: InboundMessage;
+  prompt: string;
+  state: TurnJobState;
+  createdAt: number;
 }

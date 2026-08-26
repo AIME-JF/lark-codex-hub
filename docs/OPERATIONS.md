@@ -23,7 +23,7 @@ node .\dist\cli\index.js service stop
 node .\dist\cli\index.js service remove
 ```
 
-`service stop` 会写入本地停止请求。运行时收到请求后依次停止接收新事件、取消活动 Codex 进程树、等待当前处理器和投递器收尾，最后关闭 SQLite。正常停止后，计划任务上次结果应为 `0`。
+`service stop` 会写入本地停止请求。运行时收到请求后依次停止接收新事件、停止 TurnQueue 领取新任务、取消活动 Codex 进程树、等待任务状态落库、完成投递器收尾，最后关闭 SQLite。尚未领取的持久化 Turn 会留到下次启动。正常停止后，计划任务上次结果应为 `0`。
 
 ## 状态目录
 
@@ -55,9 +55,10 @@ node .\dist\cli\index.js service status
 - `config.v2.json` 是否符合配置 Schema。
 - DPAPI 凭据是否能被当前 Windows 用户读取。
 - 默认工作目录的真实路径是否位于允许根目录内。
-- Codex CLI 版本及新建/恢复会话参数是否兼容。
+- Codex CLI 版本、App Server 初始化以及只读 `thread/list` 是否可用。该检查不会执行真实 Turn，不能代替端到端消息验证。
 - 启用 `lark-cli` 时，机器人和用户身份是否可用。
 - SQLite schema、WAL 模式和 `integrity_check`。
+- 全局 Codex Turn 并发配置是否有效；默认同时执行 1 个任务。
 - Windows 计划任务是否正在运行。
 
 诊断不会输出 App Secret 或访问 Token。
@@ -116,7 +117,8 @@ DPAPI 凭据只能由创建它们的 Windows 用户在原 Windows 安全上下�
 
 - 已进入本地投递队列的卡片会继续重试，并复用稳定幂等 UUID。
 - 处理中断的菜单和卡片事件会重新排队。
-- 处理中断的普通消息不会自动重跑，因为 Codex 可能已经修改文件。
+- 尚未开始的 Turn 保留在持久队列中，服务恢复后继续按顺序执行。
+- 已经进入运行状态的 Turn 不会自动重跑，因为 Codex 可能已经修改文件。
 - `running` 的 Codex 记录和 `executing` 的飞书动作会标记为 `interrupted`。
 - 遗留的思考、执行或输入表情会尝试清理。
 - 资源租约过期后可以重新获得，不需要手工删除锁文件。
@@ -125,9 +127,11 @@ DPAPI 凭据只能由创建它们的 Windows 用户在原 Windows 安全上下�
 
 ## 与 Codex Desktop 共用 session
 
-Hub 会阻止自身不同飞书范围并发写入同一 Codex session；Codex Desktop 则使用 Codex 自身的原生会话锁。
+发送 `/sessions` 可以查看 `allowedRoots` 内的 Desktop、VS Code、CLI 和 Hub 全局会话；发送 `/resume <ID>` 或使用恢复按钮只会更新飞书绑定，不会加载 thread，也不会占用 writer。
 
-可以在两端查看同一 session，但不要同时发送任务。Desktop 占用时，机器人会提示另一个入口正在使用；等待任务完成后重试，或在飞书发送 `/new` 创建独立 session。
+真正发送普通消息时，Hub 才会恢复 thread 并取得 Codex writer。飞书 Turn 运行期间不要在 Desktop 或 VS Code 对同一会话发送任务；否则其中一端会收到会话正在使用的提示。最后一个飞书 Turn 完成、失败或取消后，Hub 会回收自己的 App Server 子进程，writer 随即释放，不需要等待线程的内存保留期。
+
+三端共用的是持久历史，不是实时 UI 事件流。飞书完成后，如 Desktop 或 VS Code 已经打开该会话，可能需要刷新或重新打开才能看到新增内容。
 
 ## 卸载
 
@@ -157,13 +161,14 @@ node .\dist\cli\index.js service remove
 
 ### 机器人回复“当前会话正忙”
 
-- 检查 Codex Desktop 是否正在使用同一 session。
-- 检查是否刚刚发送了另一条仍在处理的飞书消息。
+- 发送 `/status`，确认 App Server 的“基础连接”可用，并检查“最近执行”是否成功；基础连接可用不代表最近一条消息执行成功。
+- 检查 Codex Desktop 是否正在写入同一 session。
+- 发送 `/queue` 检查排队消息；同一范围的新消息会排队，不应再因 Hub 自身并发而失败。
 - Hub 租约有过期机制；服务异常退出后无需删除文件锁。
 
 ### 快捷菜单没有反应
 
-- 事件键必须使用 `hub_help`、`hub_cancel`、`hub_new`、`hub_status`、`hub_sessions`、`hub_workspace`。
+- 事件键必须使用 `hub_help`、`hub_cancel`、`hub_new`、`hub_status`、`hub_sessions`、`hub_history`、`hub_queue`、`hub_workspace`。
 - 应用必须订阅 `application.bot.menu_v6`。
 - 菜单修改后必须重新发布版本。
 

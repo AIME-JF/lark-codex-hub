@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type {
   DeliveryRequest,
-  DeliveryTarget
+  DeliveryTarget,
+  ReactionTarget
 } from "../contracts/jobs.js";
 import type {
   PresentationCard,
@@ -17,6 +18,7 @@ interface DeliveryOptions {
   idempotencyKey?: string;
   trackerId?: string;
   terminalReaction?: TerminalReaction;
+  reactionTargets?: ReactionTarget[];
 }
 
 export class DeliveryWorker {
@@ -101,6 +103,9 @@ export class DeliveryWorker {
       ...(options.trackerId ? { trackerId: options.trackerId } : {}),
       ...(options.terminalReaction
         ? { terminalReaction: options.terminalReaction }
+        : {}),
+      ...(options.reactionTargets
+        ? { reactionTargets: options.reactionTargets }
         : {})
     };
     this.store.enqueueDelivery(request, Date.now());
@@ -143,7 +148,12 @@ export class DeliveryWorker {
           await this.messenger.updateCard(item.target.messageId, item.card);
         }
         this.store.completeDelivery(item.id, this.holder, Date.now());
-        await this.finishReaction(item.target, item.trackerId, item.terminalReaction);
+        await this.finishReaction(
+          item.target,
+          item.trackerId,
+          item.terminalReaction,
+          item.reactionTargets
+        );
       } catch (error) {
         const detail = errorMessage(error);
         if (item.attempts >= this.maxAttempts) {
@@ -158,7 +168,12 @@ export class DeliveryWorker {
             deliveryId: item.id,
             error: detail
           });
-          await this.finishReaction(item.target, item.trackerId, "error");
+          await this.finishReaction(
+            item.target,
+            item.trackerId,
+            "error",
+            item.reactionTargets
+          );
         } else {
           const delay = Math.min(300_000, 2_000 * 2 ** (item.attempts - 1));
           this.store.retryDelivery(
@@ -176,11 +191,21 @@ export class DeliveryWorker {
   private async finishReaction(
     target: DeliveryTarget,
     trackerId: string | undefined,
-    result: TerminalReaction | undefined
+    result: TerminalReaction | undefined,
+    reactionTargets: ReactionTarget[] | undefined
   ): Promise<void> {
-    if (!trackerId || !result || target.kind !== "reply") {
+    if (!result) {
       return;
     }
-    await this.reactions.track(trackerId, target.messageId).finish(result);
+    const targets = reactionTargets ?? (
+      trackerId && target.kind === "reply"
+        ? [{ trackerId, messageId: target.messageId }]
+        : []
+    );
+    await Promise.all(
+      targets.map((item) =>
+        this.reactions.track(item.trackerId, item.messageId).finish(result)
+      )
+    );
   }
 }

@@ -15,7 +15,7 @@ describe("SQLite 数据库迁移", () => {
     );
   });
 
-  it("从 schema 3 升级到 schema 4 并保留运行与动作记录", async () => {
+  it("从 schema 3 一次升级到最新版并保留运行与动作记录", async () => {
     const directory = await mkdtemp(join(tmpdir(), "lark-codex-hub-migration-"));
     directories.push(directory);
     const database = openDatabase(join(directory, "hub.sqlite"));
@@ -54,7 +54,7 @@ describe("SQLite 数据库迁移", () => {
 
     expect(
       database.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()
-    ).toEqual({ version: 4 });
+    ).toEqual({ version: 6 });
     expect(database.prepare("SELECT state FROM runs WHERE id = 'run-1'").get()).toEqual({
       state: "completed"
     });

@@ -15,6 +15,7 @@ export const hubConfigSchema = z.object({
   }),
   codex: z.object({
     command: z.string().min(1).default("codex"),
+    backend: z.enum(["app-server", "exec"]).default("app-server"),
     sandbox: sandboxSchema.default("workspace-write"),
     model: z.string().min(1).optional(),
     timeoutMinutes: z.number().int().min(1).max(240).default(60)
@@ -47,6 +48,8 @@ export const hubConfigSchema = z.object({
     shutdownGraceSeconds: z.number().int().min(5).max(300).default(30),
     logMaxMegabytes: z.number().int().min(1).max(100).default(10),
     logRetentionFiles: z.number().int().min(1).max(20).default(5),
+    queueCoalesceMilliseconds: z.number().int().min(0).max(5_000).default(800),
+    maxConcurrentTurns: z.number().int().min(1).max(8).default(1),
     logLevel: z.enum(["debug", "info", "warn", "error"]).default("info")
   })
 });
@@ -72,6 +75,7 @@ export function createDefaultConfig(ownerOpenId: string, workspaceRoot: string):
     },
     codex: {
       command: "codex",
+      backend: "app-server",
       sandbox: "workspace-write",
       timeoutMinutes: 60
     },
@@ -97,6 +101,8 @@ export function createDefaultConfig(ownerOpenId: string, workspaceRoot: string):
       shutdownGraceSeconds: 30,
       logMaxMegabytes: 10,
       logRetentionFiles: 5,
+      queueCoalesceMilliseconds: 800,
+      maxConcurrentTurns: 1,
       logLevel: "info"
     }
   });

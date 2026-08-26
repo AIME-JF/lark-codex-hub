@@ -41,6 +41,7 @@ const iconForKind: Record<CardKind, string> = {
   answer: "chat_outlined",
   help: "info_outlined",
   status: "time_outlined",
+  progress: "loading_outlined",
   notification: "bell_outlined",
   action: "done_outlined",
   confirmation: "approval_outlined"
@@ -72,6 +73,25 @@ function actionButton(action: CardAction): object {
     size: "medium",
     behaviors: [{ type: "callback", value: action.value }]
   };
+}
+
+function actionRows(actions: readonly CardAction[]): object[] {
+  const rows: object[] = [];
+  for (let index = 0; index < actions.length; index += 2) {
+    const pair = actions.slice(index, index + 2);
+    rows.push({
+      tag: "column_set",
+      flex_mode: "stretch",
+      horizontal_spacing: "8px",
+      columns: pair.map((action) => ({
+        tag: "column",
+        width: "weighted",
+        weight: 1,
+        elements: [actionButton(action)]
+      }))
+    });
+  }
+  return rows;
 }
 
 function statusBlock(input: PresentationCard, index: number, total: number): object {
@@ -142,7 +162,7 @@ export function renderCardParts(input: PresentationCard): RenderedCardPart[] {
       { tag: "markdown", content, text_size: "body" }
     ];
     if (index === total - 1) {
-      elements.push(...(input.actions ?? []).map(actionButton));
+      elements.push(...actionRows(input.actions ?? []));
     }
     return {
       card: {

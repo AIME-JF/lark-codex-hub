@@ -6,15 +6,20 @@ import type {
 } from "../contracts/events.js";
 import { AccessPolicy } from "../domain/access-policy.js";
 import { commandForBotMenu } from "../domain/bot-menu.js";
+import {
+  commandText,
+  isCommandId
+} from "../domain/command-registry.js";
 import { conversationScope, operatorScope } from "../domain/scope.js";
+import type { TurnControl } from "../domain/turn-queue.js";
 import type { Logger } from "../observability/logger.js";
 import { errorMessage } from "../observability/logger.js";
 import type { ActionBroker } from "../ports/action-broker.js";
 import type { CodingAgent } from "../ports/coding-agent.js";
 import type { StateRepository } from "../ports/state-repository.js";
 import type { WorkspaceResolver } from "../ports/workspace-resolver.js";
-import { CodexRunService } from "./codex-run-service.js";
 import { CommandRouter, type CommandContext } from "./command-router.js";
+import type { ControlCenterService } from "./control-center-service.js";
 import type { DeliveryWorker } from "./delivery-worker.js";
 import {
   LarkActionService,
@@ -22,12 +27,12 @@ import {
 } from "./lark-action-service.js";
 import { presentation, resultPresentation } from "./presentation-factory.js";
 import type { ReactionProgressService } from "./reaction-progress.js";
+import type { SessionCatalogService } from "./session-catalog-service.js";
 
 export class HubController {
   private readonly accessPolicy: AccessPolicy;
   private readonly commands: CommandRouter;
   private readonly larkActions: LarkActionService;
-  private readonly codexRuns: CodexRunService;
 
   public constructor(
     config: HubConfig,
@@ -36,7 +41,10 @@ export class HubController {
     private readonly store: StateRepository,
     reactions: ReactionProgressService,
     private readonly deliveries: DeliveryWorker,
+    private readonly turns: TurnControl,
+    sessions: SessionCatalogService,
     workspaces: WorkspaceResolver,
+    controlCenter: ControlCenterService,
     logger: Logger
   ) {
     this.accessPolicy = new AccessPolicy(config.feishu);
@@ -51,18 +59,12 @@ export class HubController {
       config,
       agent,
       store,
+      sessions,
+      turns,
       workspaces,
+      controlCenter,
       (id, context) => this.larkActions.confirm(id, context),
       (id, context) => this.larkActions.reject(id, context)
-    );
-    this.codexRuns = new CodexRunService(
-      config,
-      agent,
-      store,
-      reactions,
-      deliveries,
-      workspaces,
-      logger
     );
   }
 
@@ -95,6 +97,7 @@ export class HubController {
       scopeKey,
       operatorOpenId: message.senderOpenId,
       chatId: message.chatId,
+      message,
       reply: async (replyText, options) => {
         this.deliveries.enqueueReply(
           message.messageId,
@@ -126,7 +129,13 @@ export class HubController {
       );
       return;
     }
-    await this.codexRuns.run(message, scopeKey, text);
+    if (this.turns.shouldSteerReply(message, scopeKey)) {
+      const steered = await this.turns.steer(scopeKey, text, message);
+      if (steered) {
+        return;
+      }
+    }
+    await this.turns.enqueue(message, scopeKey, text);
   }
 
   public async handleBotMenu(action: InboundBotMenuAction): Promise<void> {
@@ -182,8 +191,8 @@ export class HubController {
       action.chatId
     );
     if (!access.allowed) {
-      this.deliveries.enqueueUpdate(
-        action.messageId,
+      this.deliveries.enqueueSend(
+        { type: "open_id", id: action.operatorOpenId },
         resultPresentation("操作被拒绝", "当前用户没有权限执行该操作。", false),
         { idempotencyKey: `${action.actionId}:denied` }
       );
@@ -195,6 +204,50 @@ export class HubController {
         : undefined;
     const command = typeof value?.command === "string" ? value.command : undefined;
     const id = typeof value?.id === "string" ? value.id : undefined;
+    const args = typeof value?.args === "string" ? value.args : "";
+    const page = typeof value?.page === "number" && Number.isSafeInteger(value.page)
+      ? value.page
+      : undefined;
+    const scopeKey = operatorScope(action.chatId, action.operatorOpenId);
+    const legacyCommand = command === "resume_session" && id
+      ? commandText("resume", id)
+      : command === "new_session"
+        ? commandText("new")
+        : command === "cancel_turns"
+          ? commandText("cancel")
+          : command === "sessions_page" && page && page > 0
+            ? commandText("sessions", String(page))
+            : undefined;
+    if (command === "registered_command" || legacyCommand) {
+      let routed = legacyCommand;
+      if (!routed) {
+        if (!isCommandId(id)) {
+          this.deliveries.enqueueUpdate(
+            action.messageId,
+            resultPresentation("无效操作", "卡片命令已经失效，请重新打开控制中心。", false),
+            { idempotencyKey: `${action.actionId}:invalid-command` }
+          );
+          return;
+        }
+        routed = commandText(id, args);
+      }
+      await this.commands.handle(
+        {
+          scopeKey,
+          operatorOpenId: action.operatorOpenId,
+          chatId: action.chatId,
+          reply: async (replyText, options) => {
+            this.deliveries.enqueueUpdate(
+              action.messageId,
+              presentation(replyText, options),
+              { idempotencyKey: `${action.actionId}:command:${id}` }
+            );
+          }
+        },
+        routed
+      );
+      return;
+    }
     if (!id || (command !== "confirm" && command !== "reject")) {
       this.deliveries.enqueueUpdate(
         action.messageId,
@@ -207,7 +260,7 @@ export class HubController {
       const rejected = this.larkActions.reject(id, {
         operatorOpenId: action.operatorOpenId,
         chatId: action.chatId,
-        scopeKey: operatorScope(action.chatId, action.operatorOpenId)
+        scopeKey
       });
       this.deliveries.enqueueUpdate(
         action.messageId,
@@ -230,7 +283,7 @@ export class HubController {
     const result = await this.larkActions.confirm(id, {
       operatorOpenId: action.operatorOpenId,
       chatId: action.chatId,
-      scopeKey: operatorScope(action.chatId, action.operatorOpenId)
+      scopeKey
     });
     this.deliveries.enqueueUpdate(
       action.messageId,

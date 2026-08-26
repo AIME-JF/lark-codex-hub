@@ -2,11 +2,23 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { FileConfigStore } from "../adapters/config/file-config.js";
 import { createSecretVault } from "../adapters/secrets/create-vault.js";
-import { openDatabase } from "../adapters/sqlite/database.js";
+import {
+  LATEST_SCHEMA_VERSION,
+  openDatabase
+} from "../adapters/sqlite/database.js";
 import { SqliteStateStore } from "../adapters/sqlite/state-store.js";
 import { scheduledTaskStatus } from "../adapters/windows/scheduled-task.js";
 import { resolveCommand } from "../adapters/process/command-resolver.js";
 import { NodeWorkspaceResolver } from "../adapters/fs/node-workspace-resolver.js";
+import { CodexAppServerAgent } from "../adapters/codex/codex-app-server-agent.js";
+import type { Logger } from "../observability/logger.js";
+
+const quietLogger: Logger = {
+  debug: () => undefined,
+  info: () => undefined,
+  warn: () => undefined,
+  error: () => undefined
+};
 
 export interface DoctorCheck {
   name: string;
@@ -91,24 +103,54 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
     checks.push({ name: "Codex CLI", ok: false, detail: String(error) });
   }
 
-  try {
-    await commandOutput(config.codex.command, [
-      "exec",
-      "--json",
-      "--color",
-      "never",
-      "-c",
-      'approval_policy="never"',
-      "--sandbox",
-      config.codex.sandbox,
-      "--cd",
-      config.workspace.defaultRoot,
-      "resume",
-      "--help"
-    ]);
-    checks.push({ name: "Codex 参数", ok: true, detail: "新建与恢复会话参数兼容" });
-  } catch (error) {
-    checks.push({ name: "Codex 参数", ok: false, detail: String(error) });
+  if (config.codex.backend === "app-server") {
+    let agent: CodexAppServerAgent | undefined;
+    try {
+      const resolved = await resolveCommand(config.codex.command);
+      agent = new CodexAppServerAgent(
+        resolved.executable,
+        quietLogger,
+        resolved.prefixArgs
+      );
+      const health = await agent.health();
+      if (!health.ready) {
+        throw new Error(health.detail);
+      }
+      const threads = await agent.listThreads({
+        limit: 1,
+        sourceKinds: ["cli", "vscode", "exec", "appServer"],
+        useStateDbOnly: true
+      });
+      checks.push({
+        name: "Codex App Server",
+        ok: true,
+        detail: `${health.detail}；只读会话探测 ${threads.threads.length} 条；未执行真实 Turn`
+      });
+    } catch (error) {
+      checks.push({ name: "Codex App Server", ok: false, detail: String(error) });
+    } finally {
+      await agent?.shutdown(2_000);
+    }
+  } else {
+    try {
+      await commandOutput(config.codex.command, [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "-c",
+        'approval_policy="never"',
+        "--sandbox",
+        config.codex.sandbox,
+        "--cd",
+        config.workspace.defaultRoot,
+        "resume",
+        "--help"
+      ]);
+      checks.push({ name: "Codex 参数", ok: true, detail: "兼容 Exec 后端参数可用" });
+    } catch (error) {
+      checks.push({ name: "Codex 参数", ok: false, detail: String(error) });
+    }
   }
 
   if (config.larkCli.enabled) {
@@ -137,6 +179,7 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
     checks.push({
       name: "SQLite",
       ok:
+        health.schemaVersion === LATEST_SCHEMA_VERSION &&
         health.journalMode.toLowerCase() === "wal" &&
         health.integrity.toLowerCase() === "ok",
       detail: `schema=${health.schemaVersion}, journal=${health.journalMode}, integrity=${health.integrity}`
@@ -144,6 +187,12 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
   } catch (error) {
     checks.push({ name: "SQLite", ok: false, detail: String(error) });
   }
+
+  checks.push({
+    name: "任务并发",
+    ok: config.runtime.maxConcurrentTurns >= 1,
+    detail: `最多同时执行 ${config.runtime.maxConcurrentTurns} 个 Codex 任务`
+  });
 
   if (process.platform === "win32") {
     try {

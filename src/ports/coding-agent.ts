@@ -1,4 +1,12 @@
-import type { ExecutionEvent, ExecutionRequest, ExecutionResult } from "../contracts/events.js";
+import type {
+  AgentHealth,
+  AgentThreadDetails,
+  AgentThreadListRequest,
+  AgentThreadPage,
+  ExecutionEvent,
+  ExecutionRequest,
+  ExecutionResult
+} from "../contracts/events.js";
 
 export interface CodingAgent {
   run(
@@ -6,6 +14,10 @@ export interface CodingAgent {
     onEvent: (event: ExecutionEvent) => Promise<void>
   ): Promise<ExecutionResult>;
   cancel(scopeKey: string): boolean;
+  steer?(scopeKey: string, prompt: string): Promise<boolean>;
+  health?(): Promise<AgentHealth>;
+  listThreads?(request: AgentThreadListRequest): Promise<AgentThreadPage>;
+  readThread?(threadId: string, includeTurns: boolean): Promise<AgentThreadDetails>;
   activeScopes(): readonly string[];
   shutdown(graceMs: number): Promise<void>;
 }

@@ -2,6 +2,56 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [1.3.0] - 2026-08-26
+
+### Added
+
+- A context-aware Codex control center with session, history, workspace, queue, status, stop, and Lark-tool actions.
+- A single command registry that drives slash parsing, help content, bot-menu keys, and card callbacks.
+- Paginated conversation history, localized thread states, allowed-root workspace buttons, and a configurable global Codex turn limit.
+- Delivery revisions that supersede stale card retries before they can overwrite a newer card.
+
+### Changed
+
+- Personal workstations execute one Codex turn at a time by default through `runtime.maxConcurrentTurns`.
+- Card actions render in compact two-column rows and unknown slash commands are rejected locally.
+- Shutdown stops TurnQueue claims before closing App Server and draining durable delivery work.
+- Database upgrades now apply every missing schema migration in one transaction.
+
+### Fixed
+
+- Old App Server process events can no longer clear a newly spawned process or reject its RPC requests.
+- Turn completion, timeout, cancellation, shutdown, and disconnect now share a single-settlement guard.
+- Read-only thread operations delay App Server recycling until their RPC work completes.
+- Final live-card delivery is persisted before the live record is marked complete.
+- Unauthorized card clicks no longer replace a shared group card with an access-denied result.
+
+## [1.2.0] - 2026-08-25
+
+### Added
+
+- A long-lived Codex App Server adapter with initialize, thread start/resume/read/list, turn start/steer/interrupt, streamed events, and safe request rejection.
+- A durable FIFO turn queue with 800 ms rapid-message coalescing, `/queue`, `/steer`, reply-to-active steering, cancellation, and restart recovery.
+- Live Card 2.0 streaming that updates one progress card and reliably finalizes it through the delivery outbox.
+- Readable `/sessions` cards with recovery buttons and `/history` for recent user/assistant messages.
+- Real App Server handshake and read-only `thread/list` checks in `doctor`.
+
+### Changed
+
+- App Server is now the default execution backend; the per-message Exec adapter remains available through `codex.backend = "exec"`.
+- `/status` reports App Server connection, execution backend, active turn, and pending queue depth.
+- Terminal reactions can be completed for every message in a coalesced batch.
+- Unrelated Lark SDK “no handler” warnings are filtered from normal service logs.
+
+### Fixed
+
+- Stable App Server clients no longer send the experimental `thread/resume.excludeTurns` field.
+- `/status` distinguishes basic App Server connectivity from the latest Codex run result instead of reporting a false healthy state after a failed turn.
+- App Server resume requests now have a protocol-level regression test against experimental-field leakage.
+- Current Codex native lock wording (`already has an active writer`) is recognized as a session handoff conflict.
+- New messages sent while a Feishu turn is active no longer fail just because Hub itself is busy.
+- Interrupted live cards receive a clear recovery terminal state after service restart.
+
 ## [1.1.0] - 2026-08-24
 
 ### Added
@@ -26,3 +76,5 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Schema 3 to schema 4 migration while preserving session and run history.
 
 [1.1.0]: https://github.com/AIME-JF/lark-codex-hub/commit/67f144ae40bb57a2ae0d2b09debad217d61961b4
+[1.2.0]: https://github.com/AIME-JF/lark-codex-hub/compare/v1.1.0...v1.2.0
+[1.3.0]: https://github.com/AIME-JF/lark-codex-hub/compare/v1.2.0...HEAD

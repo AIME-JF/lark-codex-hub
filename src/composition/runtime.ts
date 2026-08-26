@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { FileConfigStore } from "../adapters/config/file-config.js";
 import { CodexExecAgent } from "../adapters/codex/codex-exec-agent.js";
+import { CodexAppServerAgent } from "../adapters/codex/codex-app-server-agent.js";
 import { FeishuMessenger } from "../adapters/feishu/feishu-messenger.js";
 import { LarkCliActionBroker } from "../adapters/lark-cli/lark-cli-action-broker.js";
 import { NodeWorkspaceResolver } from "../adapters/fs/node-workspace-resolver.js";
@@ -13,8 +14,14 @@ import { DeliveryWorker } from "../application/delivery-worker.js";
 import { InboundWorker } from "../application/inbound-worker.js";
 import { RecoveryService } from "../application/recovery-service.js";
 import { ReactionProgressService } from "../application/reaction-progress.js";
+import { CodexRunService } from "../application/codex-run-service.js";
+import { ControlCenterService } from "../application/control-center-service.js";
+import { LiveCardService } from "../application/live-card-service.js";
+import { SessionCatalogService } from "../application/session-catalog-service.js";
+import { TurnQueueService } from "../application/turn-queue-service.js";
 import { createLogger, type Logger } from "../observability/logger.js";
 import { presentation } from "../application/presentation-factory.js";
+import type { CodingAgent } from "../ports/coding-agent.js";
 
 export interface HubRuntime {
   close(): Promise<void>;
@@ -51,11 +58,17 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
     logger
   );
   const codexCommand = await resolveCommand(config.codex.command);
-  const agent = new CodexExecAgent(
-    codexCommand.executable,
-    logger,
-    codexCommand.prefixArgs
-  );
+  const agent: CodingAgent = config.codex.backend === "exec"
+    ? new CodexExecAgent(
+        codexCommand.executable,
+        logger,
+        codexCommand.prefixArgs
+      )
+    : new CodexAppServerAgent(
+        codexCommand.executable,
+        logger,
+        codexCommand.prefixArgs
+      );
   const larkCommand = config.larkCli.enabled
     ? await resolveCommand(config.larkCli.command)
     : undefined;
@@ -76,12 +89,45 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
     config.notifications.maxAttempts,
     logger
   );
+  const liveCards = new LiveCardService(
+    messenger,
+    store,
+    config.presentation.cardsEnabled,
+    logger
+  );
   const workspaces = new NodeWorkspaceResolver();
   await workspaces.resolveAllowed(
     config.workspace.defaultRoot,
     config.workspace.defaultRoot,
     config.workspace.allowedRoots
   );
+  const sessions = new SessionCatalogService(
+    agent,
+    store,
+    workspaces,
+    config.workspace.defaultRoot,
+    config.workspace.allowedRoots
+  );
+  const codexRuns = new CodexRunService(
+    config,
+    agent,
+    store,
+    reactions,
+    deliveries,
+    workspaces,
+    logger,
+    liveCards
+  );
+  const turns = new TurnQueueService(
+    store,
+    codexRuns,
+    agent,
+    reactions,
+    config.runtime.queueCoalesceMilliseconds,
+    config.runtime.maxConcurrentTurns,
+    logger
+  );
+  const controlCenter = new ControlCenterService(config, store, turns);
   const controller = new HubController(
     config,
     agent,
@@ -89,7 +135,10 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
     store,
     reactions,
     deliveries,
+    turns,
+    sessions,
     workspaces,
+    controlCenter,
     logger
   );
   const inbound = new InboundWorker(
@@ -100,7 +149,8 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
       botMenu: (action) => controller.handleBotMenu(action)
     },
     config.runtime.leaseSeconds * 1_000,
-    logger
+    logger,
+    1
   );
 
   await messenger.connect(
@@ -128,6 +178,7 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
     store.completeOutbox(item.id);
   }
   deliveries.start();
+  turns.start();
   inbound.start();
   logger.info("Lark Codex Hub 已启动", {
     owner: config.feishu.ownerOpenId,
@@ -141,12 +192,13 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
         return;
       }
       closed = true;
-      await messenger.close();
-      await Promise.all([
-        agent.shutdown(config.runtime.shutdownGraceSeconds * 1_000),
-        inbound.stopAndDrain()
-      ]);
+      await inbound.stopAndDrain();
+      turns.stopClaiming();
+      await agent.shutdown(config.runtime.shutdownGraceSeconds * 1_000);
+      await turns.stopAndDrain();
       await deliveries.stopAndDrain();
+      liveCards.close();
+      await messenger.close();
       logger.info("Lark Codex Hub 已停止");
       store.close();
     }

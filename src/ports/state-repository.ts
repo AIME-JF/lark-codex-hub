@@ -4,7 +4,9 @@ import type {
   DeliveryRecord,
   DeliveryRequest,
   InboundJobPayload,
-  InboundJobRecord
+  InboundJobRecord,
+  TurnJobRecord,
+  TurnJobState
 } from "../contracts/jobs.js";
 
 export interface RunRecord {
@@ -44,6 +46,21 @@ export interface ActiveReactionRecord {
   updatedAt: number;
 }
 
+export interface LiveCardRecord {
+  runId: string;
+  scopeKey: string;
+  sourceMessageId: string;
+  cardMessageId: string;
+  cardJson: string;
+  state: "active" | "completed";
+  updatedAt: number;
+}
+
+export interface TurnLaneRecord {
+  laneKey: string;
+  scopeKey: string;
+}
+
 export interface StateRepository {
   migrate(): void;
   close(): void;
@@ -68,7 +85,31 @@ export interface StateRepository {
   releaseLease(scopeKey: string, holder: string): void;
   createRun(run: RunRecord): void;
   finishRun(id: string, state: RunRecord["state"], finishedAt: number, error?: string): void;
+  getLatestRun(scopeKey: string): RunRecord | undefined;
   interruptRunningRuns(now: number): number;
+  enqueueTurnJob(record: TurnJobRecord): boolean;
+  listReadyTurnLanes(before: number, limit: number): TurnLaneRecord[];
+  claimTurnBatch(
+    laneKey: string,
+    scopeKey: string,
+    holder: string,
+    now: number,
+    coalesceMs: number
+  ): TurnJobRecord[];
+  finishTurnJobs(
+    ids: readonly string[],
+    state: Exclude<TurnJobState, "pending" | "running">,
+    now: number,
+    error?: string
+  ): void;
+  cancelPendingTurns(scopeKey: string, now: number): TurnJobRecord[];
+  listPendingTurns(scopeKey: string, limit: number): TurnJobRecord[];
+  countPendingTurns(scopeKey: string): number;
+  recoverTurnJobs(now: number): TurnJobRecord[];
+  saveLiveCard(record: LiveCardRecord): void;
+  getLiveCard(runId: string): LiveCardRecord | undefined;
+  listActiveLiveCards(): LiveCardRecord[];
+  finishLiveCard(runId: string, now: number): void;
   saveActiveReaction(record: ActiveReactionRecord): void;
   getActiveReaction(trackerId: string): ActiveReactionRecord | undefined;
   listActiveReactions(): ActiveReactionRecord[];

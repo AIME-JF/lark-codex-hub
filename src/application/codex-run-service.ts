@@ -1,14 +1,48 @@
 import { randomUUID } from "node:crypto";
 import type { HubConfig } from "../contracts/config.js";
 import type { ExecutionEvent, InboundMessage } from "../contracts/events.js";
+import type { ReactionTarget } from "../contracts/jobs.js";
+import type { PresentationCard } from "../contracts/presentation.js";
+import { ProgressTranscript } from "../domain/progress-transcript.js";
 import type { Logger } from "../observability/logger.js";
 import { errorMessage } from "../observability/logger.js";
 import type { CodingAgent } from "../ports/coding-agent.js";
 import type { StateRepository } from "../ports/state-repository.js";
 import type { WorkspaceResolver } from "../ports/workspace-resolver.js";
 import type { DeliveryWorker } from "./delivery-worker.js";
+import type { LiveCardService } from "./live-card-service.js";
 import { durationText, presentation } from "./presentation-factory.js";
-import type { ReactionProgressService } from "./reaction-progress.js";
+import type {
+  ReactionProgressService,
+  ReactionTracker
+} from "./reaction-progress.js";
+
+export interface CodexRunOptions {
+  runId?: string;
+  reactionTargets?: ReactionTarget[];
+}
+
+export interface CodexRunOutcome {
+  state: "completed" | "failed" | "cancelled" | "busy";
+  terminalDeliveryQueued: boolean;
+  error?: string;
+}
+
+function progressCard(
+  transcript: ProgressTranscript,
+  status: string,
+  cwd: string,
+  completed = false
+): PresentationCard {
+  return presentation(transcript.markdown(), {
+    title: "Codex 执行过程",
+    kind: completed ? "status" : "progress",
+    tone: "neutral",
+    status,
+    subtitle: new Date(transcript.startedAt).toLocaleString("zh-CN"),
+    fields: [{ label: "工作目录", value: cwd }]
+  });
+}
 
 export class CodexRunService {
   public constructor(
@@ -18,15 +52,21 @@ export class CodexRunService {
     private readonly reactions: ReactionProgressService,
     private readonly deliveries: DeliveryWorker,
     private readonly workspaces: WorkspaceResolver,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly liveCards?: LiveCardService
   ) {}
+
+  public activeCardMessageId(runId: string): string | undefined {
+    return this.liveCards?.activeMessageId(runId);
+  }
 
   public async run(
     message: InboundMessage,
     scopeKey: string,
-    prompt: string
-  ): Promise<void> {
-    const runId = randomUUID();
+    prompt: string,
+    options: CodexRunOptions = {}
+  ): Promise<CodexRunOutcome> {
+    const runId = options.runId ?? randomUUID();
     const now = Date.now();
     const leaseMs = this.config.runtime.leaseSeconds * 1_000;
     const link = this.store.getConversation(scopeKey);
@@ -42,16 +82,17 @@ export class CodexRunService {
         this.config.workspace.allowedRoots
       );
     } catch (error) {
+      const detail = errorMessage(error);
       this.deliveries.enqueueReply(
         message.messageId,
-        presentation(errorMessage(error), {
+        presentation(detail, {
           title: "工作目录不可用",
           tone: "error",
           status: "无法执行"
         }),
         { idempotencyKey: `${message.eventId}:workspace-error` }
       );
-      return;
+      return { state: "failed", terminalDeliveryQueued: false, error: detail };
     }
 
     const leaseResource = link?.sessionId
@@ -67,7 +108,7 @@ export class CodexRunService {
         }),
         { idempotencyKey: `${message.eventId}:busy` }
       );
-      return;
+      return { state: "busy", terminalDeliveryQueued: false };
     }
 
     this.store.createRun({
@@ -91,24 +132,67 @@ export class CodexRunService {
     }, Math.max(10_000, Math.floor(leaseMs / 3)));
     heartbeat.unref();
 
-    const progress = this.reactions.track(runId, message.messageId);
-    await progress.thinking();
+    const reactionTargets = options.reactionTargets ?? [
+      { trackerId: runId, messageId: message.messageId }
+    ];
+    const progress = reactionTargets.map((target) =>
+      this.reactions.track(target.trackerId, target.messageId)
+    );
+    await Promise.all(progress.map((tracker) => tracker.thinking()));
     let currentSessionId = link?.sessionId;
     let usage: { inputTokens: number; outputTokens: number } | undefined;
+    let streamedText = "";
+    const transcript = new ProgressTranscript(now);
+
+    const transition = async (
+      action: (tracker: ReactionTracker) => Promise<void>
+    ): Promise<void> => {
+      await Promise.all(progress.map(action));
+    };
+    const showLive = async (status: string): Promise<void> => {
+      if (!this.liveCards) {
+        return;
+      }
+      const card = progressCard(transcript, status, cwd);
+      const existing = this.liveCards.activeMessageId(runId);
+      if (existing) {
+        await this.liveCards.update(runId, card);
+      } else {
+        await this.liveCards.ensure(runId, scopeKey, message.messageId, card);
+      }
+    };
     const onEvent = async (event: ExecutionEvent): Promise<void> => {
       if (event.type === "session") {
         currentSessionId = event.sessionId;
+        transcript.record(`已连接 Codex 会话：${event.sessionId}`);
         this.store.bindConversation({
           scopeKey,
           sessionId: event.sessionId,
           cwd,
           updatedAt: Date.now()
         });
+        await showLive("会话已连接");
       } else if (event.type === "progress") {
         this.logger.debug("Codex 执行进度", { scopeKey, label: event.label });
-        await progress.working();
+        transcript.record(event.label);
+        await transition((tracker) => tracker.working());
+        await showLive(event.label);
+      } else if (event.type === "reasoning") {
+        transcript.record(event.label);
+        await transition((tracker) => tracker.working());
+        await showLive(event.label);
+      } else if (event.type === "message-delta") {
+        streamedText = event.text;
+        transcript.record("正在生成回复");
+        transcript.setPreview(streamedText);
+        await transition((tracker) => tracker.typing());
+        await showLive("正在生成回复");
       } else if (event.type === "message") {
-        await progress.typing();
+        streamedText = event.text;
+        transcript.record("回复生成完成");
+        transcript.setPreview(streamedText);
+        await transition((tracker) => tracker.typing());
+        await showLive("正在完成回复");
       } else if (event.type === "usage") {
         usage = {
           inputTokens: event.inputTokens,
@@ -124,6 +208,7 @@ export class CodexRunService {
 
     let deliveryQueued = false;
     try {
+      await showLive("正在启动 Codex");
       const result = await this.agent.run(
         {
           scopeKey,
@@ -144,63 +229,80 @@ export class CodexRunService {
           updatedAt: Date.now()
         });
       }
-      this.store.finishRun(
-        runId,
-        result.cancelled ? "cancelled" : "completed",
-        Date.now()
+      const runState = result.cancelled ? "cancelled" : "completed";
+      this.store.finishRun(runId, runState, Date.now());
+      const finalText = result.finalText || "Codex 已完成，但没有返回文本结果。";
+      const finalCard = presentation(finalText, {
+        title: result.cancelled ? "Codex 任务已取消" : "Codex 回复",
+        kind: "answer",
+        tone: result.cancelled ? "neutral" : "success",
+        status: result.cancelled ? "已取消" : "已完成",
+        subtitle: new Date().toLocaleString("zh-CN"),
+        fields: [
+          { label: "耗时", value: durationText(result.durationMs) },
+          { label: "工作目录", value: cwd },
+          {
+            label: "Codex 会话",
+            value: result.sessionId ?? currentSessionId ?? "尚未创建"
+          },
+          ...(usage
+            ? [
+                {
+                  label: "Token",
+                  value: `${usage.inputTokens} 输入 / ${usage.outputTokens} 输出`
+                }
+              ]
+            : [])
+        ]
+      });
+      const terminalReaction = result.cancelled ? "cancelled" : "success";
+      transcript.record(result.cancelled ? "任务已取消" : "任务执行完成");
+      transcript.setPreview(streamedText || finalText);
+      const frozenCard = progressCard(
+        transcript,
+        result.cancelled ? "已取消" : "已完成",
+        cwd,
+        true
       );
-      this.deliveries.enqueueReply(
-        message.messageId,
-        presentation(result.finalText || "Codex 已完成，但没有返回文本结果。", {
-          title: result.cancelled ? "Codex 任务已取消" : "Codex 回复",
-          kind: "answer",
-          tone: result.cancelled ? "neutral" : "success",
-          status: result.cancelled ? "已取消" : "已完成",
-          subtitle: new Date().toLocaleString("zh-CN"),
-          fields: [
-            { label: "耗时", value: durationText(result.durationMs) },
-            { label: "工作目录", value: cwd },
-            {
-              label: "Codex 会话",
-              value: result.sessionId ?? currentSessionId ?? "尚未创建"
-            },
-            ...(usage
-              ? [
-                  {
-                    label: "Token",
-                    value: `${usage.inputTokens} 输入 / ${usage.outputTokens} 输出`
-                  }
-                ]
-              : [])
-          ]
-        }),
-        {
-          idempotencyKey: `${message.eventId}:codex-result`,
-          trackerId: runId,
-          terminalReaction: result.cancelled ? "cancelled" : "success"
-        }
-      );
+      await this.liveCards?.finish(runId, frozenCard, (liveMessageId, card) => {
+        this.deliveries.enqueueUpdate(liveMessageId, card, {
+          idempotencyKey: `${message.eventId}:codex-process-complete`
+        });
+      });
+      this.deliveries.enqueueReply(message.messageId, finalCard, {
+        idempotencyKey: `${message.eventId}:codex-result`,
+        terminalReaction,
+        reactionTargets
+      });
       deliveryQueued = true;
+      return {
+        state: result.cancelled ? "cancelled" : "completed",
+        terminalDeliveryQueued: true
+      };
     } catch (error) {
       const detail = errorMessage(error);
       this.store.finishRun(runId, "failed", Date.now(), detail);
       this.logger.error("Codex 任务失败", { runId, scopeKey, error: detail });
+      const errorCard = presentation(`执行失败：${detail}`, {
+        title: "Codex 执行失败",
+        kind: "answer",
+        tone: "error",
+        status: "失败",
+        fields: [{ label: "工作目录", value: cwd }]
+      });
       try {
-        this.deliveries.enqueueReply(
-          message.messageId,
-          presentation(`执行失败：${detail}`, {
-            title: "Codex 执行失败",
-            kind: "answer",
-            tone: "error",
-            status: "失败",
-            fields: [{ label: "工作目录", value: cwd }]
-          }),
-          {
-            idempotencyKey: `${message.eventId}:codex-error`,
-            trackerId: runId,
-            terminalReaction: "error"
-          }
-        );
+        transcript.record("任务执行失败");
+        const frozenCard = progressCard(transcript, "执行失败", cwd, true);
+        await this.liveCards?.finish(runId, frozenCard, (liveMessageId, card) => {
+          this.deliveries.enqueueUpdate(liveMessageId, card, {
+            idempotencyKey: `${message.eventId}:codex-process-failed`
+          });
+        });
+        this.deliveries.enqueueReply(message.messageId, errorCard, {
+          idempotencyKey: `${message.eventId}:codex-error`,
+          terminalReaction: "error",
+          reactionTargets
+        });
         deliveryQueued = true;
       } catch (deliveryError) {
         this.logger.error("Codex 结果无法进入投递队列", {
@@ -208,9 +310,14 @@ export class CodexRunService {
           error: errorMessage(deliveryError)
         });
       }
+      return {
+        state: "failed",
+        terminalDeliveryQueued: deliveryQueued,
+        error: detail
+      };
     } finally {
       if (!deliveryQueued) {
-        await progress.abandon();
+        await Promise.all(progress.map((tracker) => tracker.abandon()));
       }
       clearInterval(heartbeat);
       this.store.releaseLease(leaseResource, runId);

@@ -90,4 +90,34 @@ describe("SqliteStateStore", () => {
     store.finishAction("action-1", "rejected", 6);
     expect(store.getPendingAction("action-1")).toBeUndefined();
   });
+
+  it("按范围返回最近一次 Codex 运行结果", () => {
+    store.createRun({
+      id: "run-old",
+      scopeKey: "scope",
+      sessionId: "session",
+      state: "completed",
+      startedAt: 10,
+      finishedAt: 20
+    });
+    store.createRun({
+      id: "run-latest",
+      scopeKey: "scope",
+      sessionId: "session",
+      state: "running",
+      startedAt: 30
+    });
+    store.finishRun("run-latest", "failed", 40, "协议不兼容");
+
+    expect(store.getLatestRun("scope")).toEqual({
+      id: "run-latest",
+      scopeKey: "scope",
+      sessionId: "session",
+      state: "failed",
+      startedAt: 30,
+      finishedAt: 40,
+      error: "协议不兼容"
+    });
+    expect(store.getLatestRun("other")).toBeUndefined();
+  });
 });

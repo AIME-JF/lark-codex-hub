@@ -20,6 +20,11 @@ export interface Messenger {
     card: PresentationCard,
     idempotencyKey?: string
   ): Promise<string | undefined>;
+  replyLiveCard?(
+    messageId: string,
+    card: PresentationCard,
+    idempotencyKey: string
+  ): Promise<string | undefined>;
   sendCard(
     target: { type: "open_id" | "chat_id"; id: string },
     card: PresentationCard,

@@ -2,12 +2,12 @@
 
 [English](README.en.md) · [飞书配置](docs/FEISHU_SETUP.md) · [运维手册](docs/OPERATIONS.md) · [架构说明](ARCHITECTURE.md)
 
-![version](https://img.shields.io/badge/version-1.1.0-3370ff)
+![version](https://img.shields.io/badge/version-1.3.0-3370ff)
 ![platform](https://img.shields.io/badge/platform-Windows-0078d4)
 ![node](https://img.shields.io/badge/Node.js-%3E%3D22.12-339933)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-把你自己的飞书机器人变成一条通往本机 Codex CLI 的安全、可靠、可恢复的远程通道。
+把你自己的飞书机器人变成一条通往本机 Codex App Server 的安全、可靠、可恢复的远程通道。
 
 你可以离开电脑后继续在飞书中交代编码任务、续接 Codex 会话、切换工作目录、接收完成通知，并通过受控的 `lark-cli` 扩展操作飞书。所有代码和凭据都留在自己的 Windows 电脑上，不需要公网服务器或第三方中转服务。
 
@@ -20,20 +20,24 @@
 - **对话不会因重启丢失**：飞书会话与 Codex session 持久绑定，可查看历史或继续执行。
 - **结果不会悄悄消失**：入站事件和回复先写入 SQLite，发送失败会自动重试。
 - **进度一眼可见**：原消息依次显示思考、执行、输入、完成或失败表情。
+- **回复实时更新**：Codex 输出会持续写入同一张进度卡片，结束后原卡片切换为正式结果。
+- **连续消息不用重发**：执行中的新消息持久排队，短时间连续输入会自动合并，也可以用 `/steer` 追加到当前任务。
 - **默认收紧权限**：仅允许指定用户和会话，工作目录必须在白名单根目录内。
 - **开机静默运行**：通过 Windows 任务计划程序启动，不弹出容易误关的 CMD 窗口。
+- **一个控制中心完成操作**：命令菜单会根据空闲、排队或执行状态动态显示会话、项目、队列和停止按钮。
 
 ## 功能一览
 
 | 能力 | 基础安装 | 说明 |
 | --- | :---: | --- |
-| 飞书远程调用 Codex CLI | ✅ | 新建、续接、恢复和取消会话 |
-| Card 2.0 回复 | ✅ | Markdown、长内容分片、状态和 Token 信息 |
+| 飞书远程调用 Codex App Server | ✅ | 全局会话发现、新建、续接、恢复、转向和取消会话 |
+| Desktop / VS Code 会话接续 | ✅ | 白名单目录内按来源发现和绑定；任务结束后释放 writer |
+| 流式 Card 2.0 回复 | ✅ | 单卡增量更新、Markdown、长内容分片、状态和 Token 信息 |
 | 进度与终态表情 | 可选 | 需要消息表情权限 |
-| 持久化与断电恢复 | ✅ | SQLite WAL、入站队列、投递队列和幂等键 |
+| 持久化与断电恢复 | ✅ | SQLite WAL、入站队列、Turn 队列、投递队列和幂等键 |
 | Session 并发保护 | ✅ | 防止不同飞书入口同时写入同一 Codex session |
 | 主动通知 | ✅ | 本地脚本可主动把任务结果发送给你 |
-| 飞书快捷菜单 | 可选 | 帮助、状态、历史会话、目录、新建和取消 |
+| 飞书快捷菜单 | 可选 | 动态控制中心、状态、历史会话、目录、新建和取消 |
 | 创建飞书任务/文档、代发消息 | 可选 | 需要安装并授权 `lark-cli`，高风险操作需卡片确认 |
 
 ## 工作方式
@@ -44,11 +48,14 @@ flowchart LR
     WS --> IQ[(入站事件队列)]
     IQ --> ACL{访问与目录校验}
     ACL --> CMD[命令与会话路由]
-    CMD --> CODEX[本机 Codex CLI]
+    CMD --> TQ[(持久化 Turn 队列)]
+    TQ --> CODEX[可回收 Codex App Server]
     CMD --> LARK[可选 lark-cli 动作]
-    CODEX --> DQ[(可靠投递队列)]
+    CODEX --> LIVE[流式进度卡片]
+    CODEX --> DQ[(可靠终态投递队列)]
     LARK --> DQ
-    DQ -->|Card 2.0| U
+    LIVE -->|增量更新| U
+    DQ -->|正式 Card 2.0| U
     CODEX -.进度事件.-> REACT[原消息表情状态]
     DB[(SQLite: session / lease / run)] --- CMD
 ```
@@ -128,6 +135,26 @@ Remove-Item Env:LARK_APP_ID, Env:LARK_APP_SECRET
 }
 ```
 
+默认执行后端是可回收的 App Server。飞书 Turn 结束并进入空闲后，Hub 会回收子进程以立即释放跨客户端 writer；只有在排查兼容问题时才建议临时回退为逐消息 Exec：
+
+```json
+{
+  "codex": {
+    "backend": "exec"
+  }
+}
+```
+
+个人工作站默认只同时执行一个 Codex Turn，避免多个项目同时占满本机资源。需要时可以在运行配置中调整，最大值为 8：
+
+```json
+{
+  "runtime": {
+    "maxConcurrentTurns": 1
+  }
+}
+```
+
 ### 4. 诊断并静默启动
 
 ```powershell
@@ -149,20 +176,24 @@ node .\dist\cli\index.js service status
 
 | 命令 | 用途 |
 | --- | --- |
-| `/help`、`/hub` | 查看机器人帮助 |
+| `/help`、`/hub` | 打开动态 Codex 控制中心 |
 | `/new` | 解除当前绑定，下一条消息创建新 Codex 会话 |
 | `/status` | 查看工作目录、session 和运行状态 |
-| `/sessions` | 查看当前飞书范围内的历史 Codex 会话 |
-| `/resume <session_id>` | 恢复一个历史会话 |
+| `/sessions [页码]` | 分页查看白名单目录内的 Desktop、VS Code、CLI 与 Hub 全局会话 |
+| `/history [页码]` | 分页查看当前 Codex 会话的用户与助手消息 |
+| `/resume <session_id>` | 绑定一个白名单内的全局会话；绑定本身不会占用 writer |
 | `/cancel` | 取消当前运行任务 |
+| `/queue` | 查看当前范围等待执行的消息 |
+| `/steer <补充指令>` | 把补充指令追加到当前运行中的 Turn |
 | `/workspace` | 查看当前工作目录 |
 | `/workspace <目录>` | 切换到白名单内的目录并新建会话 |
+| `/tools` | 查看飞书扩展工具和参数 |
 | `/send <bot\|user> <open_id\|chat_id> <ID> <内容>` | 通过 `lark-cli` 发送飞书消息 |
 | `/task <标题>` | 通过用户身份创建飞书任务 |
 | `/doc <标题>` | 使用后续 Markdown 正文创建飞书文档 |
 | `/confirm <编号>`、`/reject <编号>` | 处理高风险飞书操作 |
 
-除命令外的普通文本会发送给当前 Codex 会话。
+除命令外的普通文本会发送给当前 Codex 会话；未知的 `/xxx` 命令会直接提示，不会消耗一次 Codex Turn。
 
 ## 主动通知
 
@@ -203,7 +234,9 @@ node .\dist\cli\index.js notify "构建已经完成"
 
 ## 已知限制
 
-- 飞书机器人与 Codex Desktop 可以引用同一 session，但不能同时向它写入任务；冲突时请等待一端完成，或在飞书使用 `/new`。
+- Codex App Server 命令和协议仍可能随 Codex CLI 版本演进；升级 Codex CLI 后应先运行 `doctor` 再重启服务。
+- Hub 已使用与富客户端相同的 Codex App Server 协议，但它仍是独立客户端进程。飞书 Turn 运行期间不能由 Desktop 或 VS Code 同时写入；Turn 结束后 Hub 会回收 App Server 子进程并释放 writer。绑定和只读查看不会加载会话。
+- 跨客户端共享的是持久历史，不是实时 UI 事件流；飞书完成后可能需要在 Desktop 或 VS Code 中刷新或重新打开会话。
 - 服务停止期间收到的飞书事件取决于飞书事件投递策略，项目只能恢复已经落入本地 SQLite 的事件。
 - 被强制终止的 Codex 任务不会自动重跑，因为它可能已经修改过文件；重启后机器人会提示人工检查。
 - 当前只支持文本提示，不支持从飞书消息直接传递图片或附件给 Codex。
@@ -224,7 +257,7 @@ Get-Content "$env:USERPROFILE\.lark-codex-hub\logs\hub.log" -Tail 50
 | 菜单没有反应 | 菜单事件键是否使用 `hub_*`，是否订阅 `application.bot.menu_v6` |
 | 卡片按钮无效 | 是否订阅 `card.action.trigger`，修改后是否重新发布版本 |
 | 没有进度表情 | 是否开通 `im:message.reactions:write_only` 并发布权限变更 |
-| 一直提示会话忙 | Codex Desktop 是否正在使用同一 session；本地过期租约会自动释放 |
+| 一直提示会话忙 | `/status` 的 App Server 是否已连接、Codex Desktop 是否正在写同一 session；本地过期租约会自动释放 |
 
 更多说明见[运维手册的故障排查章节](docs/OPERATIONS.md#故障排查)。
 

@@ -24,9 +24,19 @@ function stableUuid(key: string, part: string): FeishuUuid {
 }
 
 function isUnhandledEventWarning(items: readonly unknown[]): boolean {
-  return items
-    .flat(4)
-    .some((item) => typeof item === "string" && /^no .+ handle$/u.test(item));
+  const visit = (item: unknown): boolean => {
+    if (typeof item === "string") {
+      return /(?:^|\s)no .+ handle(?:\s|$)/iu.test(item);
+    }
+    if (Array.isArray(item)) {
+      return item.some(visit);
+    }
+    if (item && typeof item === "object") {
+      return Object.values(item as Record<string, unknown>).some(visit);
+    }
+    return false;
+  };
+  return items.some(visit);
 }
 
 function chunks(text: string): string[] {
@@ -56,6 +66,25 @@ function rawEventId(raw: unknown): string | undefined {
     }
   }
   return undefined;
+}
+
+function rawMessageLinks(raw: unknown): {
+  parentMessageId?: string;
+  rootMessageId?: string;
+} {
+  const root = object(raw);
+  const event = object(root?.event) ?? root;
+  const message = object(event?.message);
+  const parentMessageId = message?.parent_id;
+  const rootMessageId = message?.root_id;
+  return {
+    ...(typeof parentMessageId === "string" && parentMessageId
+      ? { parentMessageId }
+      : {}),
+    ...(typeof rootMessageId === "string" && rootMessageId
+      ? { rootMessageId }
+      : {})
+  };
 }
 
 function stableActionId(action: Lark.CardActionEvent): string {
@@ -173,6 +202,7 @@ export class FeishuMessenger implements Messenger {
             senderOpenId: message.senderId,
             text: message.content.trim(),
             mentioned: message.mentionedBot,
+            ...rawMessageLinks(message.raw),
             receivedAt: Date.now()
           };
           await this.messageHandler(event);
@@ -344,6 +374,32 @@ export class FeishuMessenger implements Messenger {
       }
     }
     return firstMessageId;
+  }
+
+  public async replyLiveCard(
+    messageId: string,
+    presentation: PresentationCard,
+    idempotencyKey: string
+  ): Promise<string | undefined> {
+    if (!this.cardsEnabled) {
+      return undefined;
+    }
+    const part = renderCardParts(presentation)[0];
+    if (!part) {
+      return undefined;
+    }
+    const response = await this.client.im.message.reply({
+      path: { message_id: messageId },
+      data: {
+        msg_type: "interactive",
+        content: JSON.stringify(part.card),
+        uuid: stableUuid(idempotencyKey, "live-card")
+      }
+    });
+    if (response.code !== undefined && response.code !== 0) {
+      throw new Error(`飞书实时卡片回复失败：${response.msg ?? String(response.code)}`);
+    }
+    return response.data?.message_id;
   }
 
   public async updateCard(messageId: string, presentation: PresentationCard): Promise<void> {

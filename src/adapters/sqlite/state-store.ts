@@ -5,7 +5,10 @@ import type {
   DeliveryRequest,
   DeliveryTarget,
   InboundJobPayload,
-  InboundJobRecord
+  InboundJobRecord,
+  ReactionTarget,
+  TurnJobRecord,
+  TurnJobState
 } from "../../contracts/jobs.js";
 import type {
   PresentationCard,
@@ -13,10 +16,12 @@ import type {
 } from "../../contracts/presentation.js";
 import type {
   ActiveReactionRecord,
+  LiveCardRecord,
   OutboxRecord,
   PendingActionRecord,
   RunRecord,
-  StateRepository
+  StateRepository,
+  TurnLaneRecord
 } from "../../ports/state-repository.js";
 import { migrateDatabase } from "./database.js";
 
@@ -70,6 +75,40 @@ interface DeliveryRow {
   attempts: number;
   tracker_id: string | null;
   terminal_reaction: TerminalReaction | null;
+  reaction_targets_json: string | null;
+  target_key: string | null;
+  revision: number | null;
+}
+
+interface TurnJobRow {
+  id: string;
+  event_id: string;
+  scope_key: string;
+  lane_key: string;
+  message_json: string;
+  prompt: string;
+  status: TurnJobState;
+  created_at: number;
+}
+
+interface LiveCardRow {
+  run_id: string;
+  scope_key: string;
+  source_message_id: string;
+  card_message_id: string;
+  card_json: string;
+  status: "active" | "completed";
+  updated_at: number;
+}
+
+interface RunRow {
+  id: string;
+  scope_key: string;
+  session_id: string | null;
+  state: RunRecord["state"];
+  started_at: number;
+  finished_at: number | null;
+  error: string | null;
 }
 
 function activeReaction(row: ActiveReactionRow): ActiveReactionRecord {
@@ -99,7 +138,49 @@ function delivery(row: DeliveryRow): DeliveryRecord {
     card: JSON.parse(row.card_json) as PresentationCard,
     attempts: row.attempts,
     ...(row.tracker_id ? { trackerId: row.tracker_id } : {}),
-    ...(row.terminal_reaction ? { terminalReaction: row.terminal_reaction } : {})
+    ...(row.terminal_reaction ? { terminalReaction: row.terminal_reaction } : {}),
+    ...(row.reaction_targets_json
+      ? { reactionTargets: JSON.parse(row.reaction_targets_json) as ReactionTarget[] }
+      : {}),
+    ...(row.target_key ? { targetKey: row.target_key } : {}),
+    ...(row.revision === null ? {} : { revision: row.revision })
+  };
+}
+
+function turnJob(row: TurnJobRow): TurnJobRecord {
+  return {
+    id: row.id,
+    eventId: row.event_id,
+    scopeKey: row.scope_key,
+    laneKey: row.lane_key,
+    message: JSON.parse(row.message_json) as TurnJobRecord["message"],
+    prompt: row.prompt,
+    state: row.status,
+    createdAt: row.created_at
+  };
+}
+
+function liveCard(row: LiveCardRow): LiveCardRecord {
+  return {
+    runId: row.run_id,
+    scopeKey: row.scope_key,
+    sourceMessageId: row.source_message_id,
+    cardMessageId: row.card_message_id,
+    cardJson: row.card_json,
+    state: row.status,
+    updatedAt: row.updated_at
+  };
+}
+
+function runRecord(row: RunRow): RunRecord {
+  return {
+    id: row.id,
+    scopeKey: row.scope_key,
+    ...(row.session_id ? { sessionId: row.session_id } : {}),
+    state: row.state,
+    startedAt: row.started_at,
+    ...(row.finished_at === null ? {} : { finishedAt: row.finished_at }),
+    ...(row.error ? { error: row.error } : {})
   };
 }
 
@@ -134,7 +215,7 @@ export class SqliteStateStore implements StateRepository {
       const deliveries = this.database
         .prepare(
           `DELETE FROM delivery_outbox
-           WHERE updated_at < ? AND status IN ('sent', 'failed')`
+           WHERE updated_at < ? AND status IN ('sent', 'failed', 'superseded')`
         )
         .run(before).changes;
       const actions = this.database
@@ -145,10 +226,21 @@ export class SqliteStateStore implements StateRepository {
            )`
         )
         .run(before).changes;
+      const turns = this.database
+        .prepare(
+          `DELETE FROM turn_jobs
+           WHERE updated_at < ? AND status IN (
+             'completed', 'failed', 'cancelled', 'interrupted'
+           )`
+        )
+        .run(before).changes;
+      const cards = this.database
+        .prepare("DELETE FROM live_cards WHERE updated_at < ? AND status = 'completed'")
+        .run(before).changes;
       const inbox = this.database
         .prepare("DELETE FROM inbox_dedup WHERE received_at < ?")
         .run(before).changes;
-      return inbound + deliveries + actions + inbox;
+      return inbound + deliveries + actions + turns + cards + inbox;
     })();
   }
 
@@ -459,6 +551,17 @@ export class SqliteStateStore implements StateRepository {
       .run(state, finishedAt, error ?? null, id);
   }
 
+  public getLatestRun(scopeKey: string): RunRecord | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT id, scope_key, session_id, state, started_at, finished_at, error
+         FROM runs WHERE scope_key = ?
+         ORDER BY started_at DESC, rowid DESC LIMIT 1`
+      )
+      .get(scopeKey) as RunRow | undefined;
+    return row ? runRecord(row) : undefined;
+  }
+
   public interruptRunningRuns(now: number): number {
     return this.database
       .prepare(
@@ -467,6 +570,223 @@ export class SqliteStateStore implements StateRepository {
          WHERE state = 'running'`
       )
       .run(now).changes;
+  }
+
+  public enqueueTurnJob(record: TurnJobRecord): boolean {
+    const result = this.database
+      .prepare(
+        `INSERT OR IGNORE INTO turn_jobs(
+           id, event_id, scope_key, lane_key, message_json, prompt,
+           status, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+      )
+      .run(
+        record.id,
+        record.eventId,
+        record.scopeKey,
+        record.laneKey,
+        JSON.stringify(record.message),
+        record.prompt,
+        record.createdAt,
+        record.createdAt
+      );
+    return result.changes === 1;
+  }
+
+  public listReadyTurnLanes(before: number, limit: number): TurnLaneRecord[] {
+    return this.database
+      .prepare(
+        `SELECT lane_key, scope_key
+         FROM turn_jobs
+         WHERE status = 'pending'
+         GROUP BY lane_key, scope_key
+         HAVING MIN(created_at) <= ?
+         ORDER BY MIN(created_at) ASC
+         LIMIT ?`
+      )
+      .all(before, limit)
+      .map((row) => {
+        const value = row as { lane_key: string; scope_key: string };
+        return { laneKey: value.lane_key, scopeKey: value.scope_key };
+      });
+  }
+
+  public claimTurnBatch(
+    laneKey: string,
+    scopeKey: string,
+    holder: string,
+    now: number,
+    coalesceMs: number
+  ): TurnJobRecord[] {
+    return this.database.transaction(() => {
+      const first = this.database
+        .prepare(
+          `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+                  status, created_at
+           FROM turn_jobs
+           WHERE status = 'pending' AND lane_key = ? AND scope_key = ?
+           ORDER BY created_at ASC, rowid ASC LIMIT 1`
+        )
+        .get(laneKey, scopeKey) as TurnJobRow | undefined;
+      if (!first) {
+        return [];
+      }
+      const rows = this.database
+        .prepare(
+          `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+                  status, created_at
+           FROM turn_jobs
+           WHERE status = 'pending' AND lane_key = ? AND scope_key = ?
+             AND created_at <= ?
+           ORDER BY created_at ASC, rowid ASC LIMIT 20`
+        )
+        .all(laneKey, scopeKey, first.created_at + coalesceMs) as TurnJobRow[];
+      if (rows.length === 0) {
+        return [];
+      }
+      const placeholders = rows.map(() => "?").join(", ");
+      const ids = rows.map((row) => row.id);
+      const changed = this.database
+        .prepare(
+          `UPDATE turn_jobs
+           SET status = 'running', holder = ?, started_at = ?, updated_at = ?
+           WHERE status = 'pending' AND id IN (${placeholders})`
+        )
+        .run(holder, now, now, ...ids).changes;
+      return changed === ids.length
+        ? rows.map((row) => turnJob({ ...row, status: "running" }))
+        : [];
+    })();
+  }
+
+  public finishTurnJobs(
+    ids: readonly string[],
+    state: Exclude<TurnJobState, "pending" | "running">,
+    now: number,
+    error?: string
+  ): void {
+    if (ids.length === 0) {
+      return;
+    }
+    const placeholders = ids.map(() => "?").join(", ");
+    this.database
+      .prepare(
+        `UPDATE turn_jobs
+         SET status = ?, holder = NULL, finished_at = ?, updated_at = ?, last_error = ?
+         WHERE id IN (${placeholders})`
+      )
+      .run(state, now, now, error?.slice(0, 2_000) ?? null, ...ids);
+  }
+
+  public cancelPendingTurns(scopeKey: string, now: number): TurnJobRecord[] {
+    return this.database.transaction(() => {
+      const rows = this.database
+        .prepare(
+          `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+                  status, created_at
+           FROM turn_jobs WHERE scope_key = ? AND status = 'pending'
+           ORDER BY created_at ASC`
+        )
+        .all(scopeKey) as TurnJobRow[];
+      this.database
+        .prepare(
+          `UPDATE turn_jobs SET status = 'cancelled', finished_at = ?, updated_at = ?
+           WHERE scope_key = ? AND status = 'pending'`
+        )
+        .run(now, now, scopeKey);
+      return rows.map(turnJob);
+    })();
+  }
+
+  public listPendingTurns(scopeKey: string, limit: number): TurnJobRecord[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+                  status, created_at
+           FROM turn_jobs WHERE scope_key = ? AND status = 'pending'
+           ORDER BY created_at ASC LIMIT ?`
+        )
+        .all(scopeKey, limit) as TurnJobRow[]
+    ).map(turnJob);
+  }
+
+  public countPendingTurns(scopeKey: string): number {
+    const row = this.database
+      .prepare(
+        "SELECT COUNT(*) AS count FROM turn_jobs WHERE scope_key = ? AND status = 'pending'"
+      )
+      .get(scopeKey) as { count: number };
+    return row.count;
+  }
+
+  public recoverTurnJobs(now: number): TurnJobRecord[] {
+    return this.database.transaction(() => {
+      const rows = this.database
+        .prepare(
+          `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+                  status, created_at
+           FROM turn_jobs WHERE status = 'running' ORDER BY created_at ASC`
+        )
+        .all() as TurnJobRow[];
+      this.database
+        .prepare(
+          `UPDATE turn_jobs SET status = 'interrupted', holder = NULL,
+             finished_at = ?, updated_at = ?,
+             last_error = COALESCE(last_error, '服务重启时任务仍处于运行状态。')
+           WHERE status = 'running'`
+        )
+        .run(now, now);
+      return rows.map(turnJob);
+    })();
+  }
+
+  public saveLiveCard(record: LiveCardRecord): void {
+    this.database
+      .prepare(
+        `INSERT INTO live_cards(
+           run_id, scope_key, source_message_id, card_message_id,
+           card_json, status, updated_at
+         ) VALUES(@runId, @scopeKey, @sourceMessageId, @cardMessageId,
+                  @cardJson, @state, @updatedAt)
+         ON CONFLICT(run_id) DO UPDATE SET
+           card_message_id = excluded.card_message_id,
+           card_json = excluded.card_json,
+           status = excluded.status,
+           updated_at = excluded.updated_at`
+      )
+      .run(record);
+  }
+
+  public getLiveCard(runId: string): LiveCardRecord | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT run_id, scope_key, source_message_id, card_message_id,
+                card_json, status, updated_at
+         FROM live_cards WHERE run_id = ?`
+      )
+      .get(runId) as LiveCardRow | undefined;
+    return row ? liveCard(row) : undefined;
+  }
+
+  public listActiveLiveCards(): LiveCardRecord[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT run_id, scope_key, source_message_id, card_message_id,
+                  card_json, status, updated_at
+           FROM live_cards WHERE status = 'active' ORDER BY updated_at ASC`
+        )
+        .all() as LiveCardRow[]
+    ).map(liveCard);
+  }
+
+  public finishLiveCard(runId: string, now: number): void {
+    this.database
+      .prepare(
+        "UPDATE live_cards SET status = 'completed', updated_at = ? WHERE run_id = ?"
+      )
+      .run(now, runId);
   }
 
   public saveActiveReaction(record: ActiveReactionRecord): void {
@@ -566,24 +886,59 @@ export class SqliteStateStore implements StateRepository {
   }
 
   public enqueueDelivery(record: DeliveryRequest, now: number): boolean {
-    const result = this.database
-      .prepare(
-        `INSERT OR IGNORE INTO delivery_outbox(
-           idempotency_key, target_json, card_json, tracker_id, terminal_reaction,
-           retry_at, created_at, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        record.idempotencyKey,
-        JSON.stringify(record.target),
-        JSON.stringify(record.card),
-        record.trackerId ?? null,
-        record.terminalReaction ?? null,
-        now,
-        now,
-        now
-      );
-    return result.changes === 1;
+    return this.database.transaction(() => {
+      const existing = this.database
+        .prepare("SELECT 1 FROM delivery_outbox WHERE idempotency_key = ?")
+        .get(record.idempotencyKey);
+      if (existing) {
+        return false;
+      }
+      const targetKey = record.target.kind === "update"
+        ? `card:${record.target.messageId}`
+        : undefined;
+      let revision: number | undefined;
+      if (targetKey) {
+        const row = this.database
+          .prepare(
+            `INSERT INTO delivery_target_versions(target_key, revision)
+             VALUES(?, 1)
+             ON CONFLICT(target_key) DO UPDATE SET revision = revision + 1
+             RETURNING revision`
+          )
+          .get(targetKey) as { revision: number };
+        revision = row.revision;
+        this.database
+          .prepare(
+            `UPDATE delivery_outbox
+             SET status = 'superseded', updated_at = ?,
+                 last_error = '已被更新版本替代。'
+             WHERE target_key = ? AND status = 'pending'`
+          )
+          .run(now, targetKey);
+      }
+      const result = this.database
+        .prepare(
+          `INSERT INTO delivery_outbox(
+             idempotency_key, target_json, card_json, tracker_id, terminal_reaction,
+             reaction_targets_json, target_key, revision,
+             retry_at, created_at, updated_at
+           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          record.idempotencyKey,
+          JSON.stringify(record.target),
+          JSON.stringify(record.card),
+          record.trackerId ?? null,
+          record.terminalReaction ?? null,
+          record.reactionTargets ? JSON.stringify(record.reactionTargets) : null,
+          targetKey ?? null,
+          revision ?? null,
+          now,
+          now,
+          now
+        );
+      return result.changes === 1;
+    })();
   }
 
   public claimDelivery(
@@ -592,10 +947,23 @@ export class SqliteStateStore implements StateRepository {
     ttlMs: number
   ): DeliveryRecord | undefined {
     return this.database.transaction(() => {
+      this.database
+        .prepare(
+          `UPDATE delivery_outbox
+           SET status = 'superseded', updated_at = ?,
+               last_error = '已被更新版本替代。'
+           WHERE status = 'pending' AND target_key IS NOT NULL
+             AND revision < (
+               SELECT latest.revision FROM delivery_target_versions AS latest
+               WHERE latest.target_key = delivery_outbox.target_key
+             )`
+        )
+        .run(now);
       const row = this.database
         .prepare(
           `SELECT id, idempotency_key, target_json, card_json, attempts,
-                  tracker_id, terminal_reaction
+                  tracker_id, terminal_reaction, reaction_targets_json,
+                  target_key, revision
            FROM delivery_outbox
            WHERE retry_at <= ? AND (
              status = 'pending' OR
@@ -645,7 +1013,14 @@ export class SqliteStateStore implements StateRepository {
     this.database
       .prepare(
         `UPDATE delivery_outbox
-         SET status = 'pending', holder = NULL, lease_expires_at = NULL,
+         SET status = CASE
+               WHEN target_key IS NOT NULL AND revision < (
+                 SELECT latest.revision FROM delivery_target_versions AS latest
+                 WHERE latest.target_key = delivery_outbox.target_key
+               ) THEN 'superseded'
+               ELSE 'pending'
+             END,
+             holder = NULL, lease_expires_at = NULL,
              attempts = ?, retry_at = ?, last_error = ?, updated_at = ?
          WHERE id = ? AND holder = ?`
       )

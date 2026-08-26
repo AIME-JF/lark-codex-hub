@@ -1,8 +1,36 @@
+import type { PresentationCard } from "../contracts/presentation.js";
 import type { Logger } from "../observability/logger.js";
 import type { StateRepository } from "../ports/state-repository.js";
 import type { DeliveryWorker } from "./delivery-worker.js";
 import { presentation } from "./presentation-factory.js";
 import type { ReactionProgressService } from "./reaction-progress.js";
+
+function interruptedProcessCard(serialized: string): PresentationCard {
+  try {
+    const current = JSON.parse(serialized) as PresentationCard;
+    if (typeof current.content !== "string") {
+      throw new Error("过程卡片缺少内容");
+    }
+    return presentation(
+      `${current.content}\n\n- 服务重启，当前执行已中断`,
+      {
+        title: "Codex 执行过程",
+        kind: "status",
+        tone: "neutral",
+        status: "已中断",
+        ...(current.subtitle ? { subtitle: current.subtitle } : {}),
+        ...(current.fields ? { fields: current.fields } : {})
+      }
+    );
+  } catch {
+    return presentation("- 服务重启，当前执行已中断", {
+      title: "Codex 执行过程",
+      kind: "status",
+      tone: "neutral",
+      status: "已中断"
+    });
+  }
+}
 
 export class RecoveryService {
   public constructor(
@@ -16,9 +44,65 @@ export class RecoveryService {
   public async recover(): Promise<void> {
     const now = Date.now();
     const inbound = this.store.recoverInbound(now);
+    const turns = this.store.recoverTurnJobs(now);
     const runs = this.store.interruptRunningRuns(now);
     const actions = this.store.interruptExecutingActions(now);
+    const activeCards = this.store.listActiveLiveCards();
     await this.reactions.recoverStale();
+
+    for (const card of activeCards) {
+      this.deliveries.enqueueUpdate(
+        card.cardMessageId,
+        interruptedProcessCard(card.cardJson),
+        { idempotencyKey: `recovery:live-card-process:${card.runId}` }
+      );
+      this.deliveries.enqueueReply(
+        card.sourceMessageId,
+        presentation(
+          "服务在任务执行期间重新启动。为避免重复修改文件，这次执行已标记为中断；排队中但尚未开始的消息会继续处理。",
+          {
+            title: "Codex 任务已中断",
+            kind: "answer",
+            tone: "warning",
+            status: "服务已恢复"
+          }
+        ),
+        {
+          idempotencyKey: `recovery:live-card-result:${card.runId}`,
+          terminalReaction: "cancelled",
+          reactionTargets: [
+            { trackerId: card.runId, messageId: card.sourceMessageId }
+          ]
+        }
+      );
+      this.store.finishLiveCard(card.runId, now);
+    }
+
+    const cardRunIds = new Set(activeCards.map((card) => card.runId));
+    for (const job of turns) {
+      if (cardRunIds.has(job.id)) {
+        continue;
+      }
+      this.deliveries.enqueueReply(
+        job.message.messageId,
+        presentation(
+          "服务在任务执行期间重新启动。这次任务已标记为中断，不会自动重跑；你可以检查项目后继续发送消息。",
+          {
+            title: "任务已中断",
+            kind: "answer",
+            tone: "warning",
+            status: "需要确认"
+          }
+        ),
+        {
+          idempotencyKey: `recovery:turn:${job.id}`,
+          terminalReaction: "cancelled",
+          reactionTargets: [
+            { trackerId: job.id, messageId: job.message.messageId }
+          ]
+        }
+      );
+    }
 
     for (const job of inbound.interruptedMessages) {
       if (job.payload.kind !== "message") {
@@ -53,10 +137,19 @@ export class RecoveryService {
         { idempotencyKey: `recovery:actions:${now}` }
       );
     }
-    if (inbound.interruptedMessages.length || inbound.requeued || runs || actions) {
+    if (
+      inbound.interruptedMessages.length ||
+      inbound.requeued ||
+      turns.length ||
+      activeCards.length ||
+      runs ||
+      actions
+    ) {
       this.logger.warn("启动恢复已处理遗留状态", {
         interruptedMessages: inbound.interruptedMessages.length,
         requeuedEvents: inbound.requeued,
+        interruptedTurns: turns.length,
+        recoveredLiveCards: activeCards.length,
         interruptedRuns: runs,
         interruptedActions: actions
       });

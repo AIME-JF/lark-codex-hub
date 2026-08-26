@@ -2,6 +2,7 @@ export type CardKind =
   | "answer"
   | "help"
   | "status"
+  | "progress"
   | "notification"
   | "action"
   | "confirmation";

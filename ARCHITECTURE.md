@@ -18,15 +18,17 @@ flowchart TB
       INBOX[(inbound_jobs)]
       POLICY[访问与工作目录策略]
       ROUTER[命令路由]
+      TURNQ[(turn_jobs)]
       RUN[CodexRunService]
+      LIVE[LiveCardService]
       ACTION[LarkActionService]
       DELIVERY[(delivery_outbox)]
       REACTION[ReactionProgressService]
-      STATE[(session / lease / run / action)]
+      STATE[(session / lease / run / live card / action)]
     end
 
     subgraph Local[本机适配器]
-      CODEX[Codex CLI]
+      CODEX[Codex App Server]
       LARKCLI[lark-cli]
       FS[真实文件系统路径]
       TASK[Windows Task Scheduler]
@@ -36,12 +38,13 @@ flowchart TB
     MENU --> NORMALIZE
     CARD --> NORMALIZE
     NORMALIZE --> INBOX --> POLICY --> ROUTER
-    ROUTER --> RUN --> CODEX
+    ROUTER --> TURNQ --> RUN --> CODEX
     ROUTER --> ACTION --> LARKCLI
     POLICY --> FS
     RUN --> STATE
     ACTION --> STATE
     RUN --> DELIVERY
+    RUN --> LIVE --> OUT
     ACTION --> DELIVERY
     DELIVERY --> OUT
     RUN --> REACTION --> OUT
@@ -63,6 +66,8 @@ src/
 
 `HubController` 只负责把通过访问策略的消息分发给命令、Codex 或飞书动作服务。业务细节分别位于独立服务中，避免把会话、工作目录、确认和投递逻辑重复写在控制器里。
 
+命令名称、别名、说明、菜单事件和卡片动作统一注册在 `command-registry`。`ControlCenterService` 根据当前会话和队列状态生成动态入口，避免帮助文本、菜单和回调路由各维护一套命令字符串。
+
 ## 持久化入站处理
 
 飞书 WebSocket 回调不会直接执行长任务，而是先把标准化事件写入 `inbound_jobs`：
@@ -70,29 +75,45 @@ src/
 1. `event_id` 和 `message_id` 通过数据库唯一约束去重。
 2. Worker 使用事务原子领取任务，并写入 holder 和过期时间。
 3. 处理中定时续约，完成或失败后写入终态。
-4. 服务启动时，卡片和菜单事件可以安全重排；普通消息标记为中断但不自动重跑。
+4. 单个 Worker 按数据库领取顺序处理消息、菜单和卡片动作，避免 `/new`、`/cancel` 与普通消息发生控制顺序竞争。
 
 不自动重跑普通消息是刻意的保守策略：进程可能在本地完成了部分文件修改，但尚未来得及记录成功。如果自动执行第二次，可能造成重复修改。
 
-## Codex 会话与并发
+## Codex App Server 与会话并发
 
-飞书范围由 `chat_id + operator_open_id` 组成，拥有当前 Codex 绑定、工作目录偏好和 session 历史。
+飞书范围由 `chat_id + operator_open_id` 组成，拥有当前 Codex 绑定、工作目录偏好和 session 历史。全局会话目录以 Codex `thread/list` 为事实来源，显式查询 `cli`、`vscode`、`exec` 和 `appServer`，再通过真实路径解析过滤到 `allowedRoots`。Hub SQLite 只保存绑定和曾使用历史，不再承担全局会话发现。
 
-新会话调用：
-
-```text
-codex exec [options] -
-```
-
-恢复会话调用：
+运行时按需启动一个 `codex app-server --listen stdio://`。Hub 通过省略 `jsonrpc` 字段的 JSONL RPC 与它通信。全局并发由 `runtime.maxConcurrentTurns` 限制，个人工作站默认值为 1：
 
 ```text
-codex exec [options] resume <session-id> -
+initialize -> initialized
+thread/start | thread/resume | thread/read | thread/list
+turn/start | turn/steer | turn/interrupt
 ```
 
-提示通过 stdin 传递，JSONL 输出转换为 session、进度、消息、用量和错误事件。子进程不经过 shell。
+`CodexExecAgent` 仍作为显式兼容后端保留，只有配置 `codex.backend = "exec"` 时才会按消息启动 `codex exec` 子进程。
 
-有 session 绑定时，租约资源键是 `session:<id>`；没有绑定时是 `scope:<key>`。这样即使两个飞书范围指向同一 session，也只有一个任务能进入 Codex。另一个 Codex 客户端造成的原生写锁错误会转换为可理解的“另一个入口正在使用”提示。
+普通文本先写入 `turn_jobs`，而不是占用入站事件 Worker：
+
+```text
+pending -> running -> completed | failed | cancelled | interrupted
+```
+
+同一会话使用 FIFO 顺序执行。800 毫秒内的连续消息合并为一个 Turn；任务运行时，`/steer` 或回复当前任务消息会调用 `turn/steer`。`/cancel` 调用 `turn/interrupt` 并清除尚未运行的当前范围消息。
+
+有 session 绑定时，队列 lane 和租约资源键都是 `session:<id>`；没有绑定时是 `scope:<key>`。这样即使两个飞书范围指向同一 session，也只有一个任务能进入 Codex。另一个独立客户端造成的 `already has an active writer` 会转换为可理解的交接提示。
+
+`thread/read` 和 `thread/list` 不会加载会话，因此 `/sessions` 与 `/resume` 的绑定步骤不占用 writer。Codex App Server 即使取消订阅也会把已加载线程保留一段时间；为让 Desktop 或 VS Code 在飞书 Turn 完成后立即接管，最后一个活动 Turn 结束、失败或取消后，Hub 会回收 App Server 子进程。Hub 主服务、飞书连接和持久队列不会停止，下一次执行会自动重新初始化 App Server。
+
+每个 App Server 子进程具有独立代际编号，旧进程的延迟 `close/error` 不能清理新实例。Turn 使用单次结算标记合并完成、超时、取消、关闭和断连路径；只读 RPC 和执行操作使用引用计数，回收只会发生在所有操作完成之后。
+
+## 流式卡片
+
+App Server 的 agent message delta、item lifecycle 和 Token 事件会被转换成稳定的展示事件。Hub 不展示原始推理内容，只显示“正在分析、运行命令、修改文件、生成回复”等用户可理解状态。
+
+第一条有效进度会创建一张可更新卡片，之后最多约每秒更新一次。Turn 完成后，同一张卡片通过可靠投递队列切换为正式结果；过长回复会把实时卡片收束为完成提示，并用后续分片卡片发送全文。
+
+实时卡片 ID 持久化到 `live_cards`。服务异常退出后，恢复流程会把遗留卡片更新为“已中断”，而已经进入 `delivery_outbox` 的正式结果继续重试。
 
 ## 可靠投递
 
@@ -101,6 +122,7 @@ codex exec [options] resume <session-id> -
 - Worker 原子领取待投递记录。
 - 失败使用有上限的指数退避。
 - 达到最大次数后进入 `failed`，不会无限重试。
+- 同一张卡片的更新具有递增 revision；新版本会把等待重试的旧版本标记为 `superseded`。
 - 回复和主动发送的飞书 UUID 由幂等键与分片序号稳定派生。
 - 远端已接受、但本地尚未标记完成时发生崩溃，重试仍使用同一 UUID。
 

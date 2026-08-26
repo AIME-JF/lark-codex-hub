@@ -11,6 +11,7 @@ export interface PresentationOptions {
   status?: string;
   subtitle?: string;
   fields?: PresentationCard["fields"];
+  actions?: PresentationCard["actions"];
 }
 
 export function presentation(
@@ -25,6 +26,7 @@ export function presentation(
     status: options.status ?? "信息",
     ...(options.subtitle ? { subtitle: options.subtitle } : {}),
     ...(options.fields ? { fields: options.fields } : {}),
+    ...(options.actions ? { actions: options.actions } : {}),
     summary: text.replace(/\s+/g, " ").slice(0, 120)
   };
 }

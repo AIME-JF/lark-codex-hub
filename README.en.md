@@ -2,12 +2,12 @@
 
 [中文](README.md) · [Feishu setup](docs/FEISHU_SETUP.md) · [Operations](docs/OPERATIONS.md) · [Architecture](ARCHITECTURE.md)
 
-![version](https://img.shields.io/badge/version-1.1.0-3370ff)
+![version](https://img.shields.io/badge/version-1.3.0-3370ff)
 ![platform](https://img.shields.io/badge/platform-Windows-0078d4)
 ![node](https://img.shields.io/badge/Node.js-%3E%3D22.12-339933)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Turn your private Feishu/Lark bot into a secure, durable, and recoverable remote control plane for Codex CLI running on your own Windows computer.
+Turn your private Feishu/Lark bot into a secure, durable, and recoverable remote control plane for Codex App Server running on your own Windows computer.
 
 You can send coding tasks from Feishu, resume Codex sessions, switch approved workspaces, receive completion cards, and optionally invoke a small allowlist of `lark-cli` actions. Source code and credentials remain on your workstation; no public server or third-party relay is required.
 
@@ -17,6 +17,9 @@ You can send coding tasks from Feishu, resume Codex sessions, switch approved wo
 ## Highlights
 
 - Create, resume, inspect, switch, and cancel Codex sessions from Feishu.
+- Discover and bind Desktop, VS Code, CLI, and Hub threads inside configured workspace roots.
+- Recycle the Hub App Server after the final active Feishu turn so another client can acquire the thread writer immediately.
+- Persist user turns in a FIFO queue, coalesce rapid messages, and stream output into one live card.
 - Persist inbound events, deliveries, sessions, leases, approvals, and recovery state in SQLite WAL.
 - Render Card 2.0 replies with Markdown continuation cards, timing, workspace, session, and token usage.
 - Show thinking, working, typing, completion, failure, and cancellation reactions on the original message.
@@ -25,6 +28,7 @@ You can send coding tasks from Feishu, resume Codex sessions, switch approved wo
 - Send proactive notifications from local scripts through a durable retry queue.
 - Optionally create Lark tasks/documents or send messages through validated `lark-cli` actions.
 - Start silently at Windows logon and stop gracefully for upgrades.
+- Use a context-aware control center card instead of memorizing every slash command.
 
 ## Data flow
 
@@ -34,7 +38,8 @@ flowchart LR
     WS --> IQ[(durable inbound queue)]
     IQ --> ACL{access and workspace policy}
     ACL --> CMD[command and session router]
-    CMD --> CODEX[local Codex CLI]
+    CMD --> TQ[(durable turn queue)]
+    TQ --> CODEX[recyclable Codex App Server]
     CMD --> LARK[optional lark-cli actions]
     CODEX --> DQ[(durable delivery queue)]
     LARK --> DQ
@@ -95,6 +100,10 @@ Remove-Item Env:LARK_APP_ID, Env:LARK_APP_SECRET
 
 Credentials are encrypted with current-user Windows DPAPI. If `lark-cli` is not installed, set `larkCli.enabled` to `false` in `%USERPROFILE%\.lark-codex-hub\config.v2.json`.
 
+The recyclable App Server backend is the default. Hub keeps it only while needed and closes the child process after the final active Feishu turn to release cross-client writer ownership. Set `codex.backend` to `exec` only as an explicit compatibility fallback.
+
+Personal workstations execute one Codex turn at a time by default. Set `runtime.maxConcurrentTurns` between 1 and 8 only when the machine has enough resources.
+
 ### 4. Diagnose and start silently
 
 ```powershell
@@ -110,20 +119,24 @@ Send `/status` to the bot. A status card confirms the full message path is worki
 
 | Command | Purpose |
 | --- | --- |
-| `/help`, `/hub` | Show help |
+| `/help`, `/hub` | Open the context-aware Codex control center |
 | `/new` | Clear the current binding; the next message creates a session |
 | `/status` | Show workspace, session, and runtime state |
-| `/sessions` | List recent sessions for the current Feishu scope |
-| `/resume <session_id>` | Resume a historical session |
+| `/sessions [page]` | Page through global Desktop, VS Code, CLI, and Hub sessions inside allowed roots |
+| `/history [page]` | Page through user and assistant messages in the bound session |
+| `/resume <session_id>` | Bind an allowed global session without loading or locking it |
 | `/cancel` | Cancel the active task |
+| `/queue` | Show messages waiting for execution |
+| `/steer <instruction>` | Add an instruction to the active turn |
 | `/workspace` | Show the current workspace |
 | `/workspace <path>` | Switch to an allowed directory and start a new session |
+| `/tools` | Show optional Feishu/Lark extension commands |
 | `/send <bot\|user> <open_id\|chat_id> <ID> <text>` | Send a validated `lark-cli` message |
 | `/task <summary>` | Create a Lark task as the authorized user |
 | `/doc <title>` | Create a Lark document from the following Markdown body |
 | `/confirm <id>`, `/reject <id>` | Resolve a risky Lark action |
 
-All other text is forwarded to the current Codex session.
+All other text is forwarded to the current Codex session. Unknown `/commands` are rejected locally instead of consuming a Codex turn.
 
 ## Proactive notifications
 
@@ -164,7 +177,9 @@ Read [Security Policy](SECURITY.md) for the full threat model and reporting guid
 
 ## Known limitations
 
-- Feishu and Codex Desktop may reference the same session, but must not write it concurrently.
+- The Codex App Server command and protocol can evolve with Codex CLI releases; run `doctor` after upgrading Codex CLI.
+- Hub uses the Codex App Server protocol, but it is still a separate client process. Feishu and Desktop or VS Code must not write the same session concurrently. Hub recycles its App Server after the final active Feishu turn to release writer ownership.
+- Cross-client sharing covers persisted history, not a shared live event stream. Refresh or reopen the thread in Desktop or VS Code after a Feishu turn when needed.
 - A forcibly interrupted Codex run is not automatically replayed because it may already have changed files.
 - The current bridge forwards text prompts only; Feishu image and file attachments are not passed to Codex.
 - Documentation for the Feishu console is Chinese-first because console labels differ by tenant and locale.

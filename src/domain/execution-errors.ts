@@ -13,7 +13,7 @@ export class ExecutionTimeoutError extends Error {
 }
 
 export function isNativeSessionBusyMessage(value: string): boolean {
-  return /(session|thread).{0,80}(lock|locked|busy|another process)|write lock|会话.{0,20}(锁|占用)/iu.test(
+  return /already has an active writer|active writer|(session|thread).{0,80}(lock|locked|busy|another process)|write lock|会话.{0,20}(锁|占用)/iu.test(
     value
   );
 }

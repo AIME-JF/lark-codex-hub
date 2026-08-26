@@ -1,12 +1,8 @@
-import { basename } from "node:path";
-import type { HubConfig } from "../contracts/config.js";
-import {
-  commandHelp,
-  registeredCommandAction
-} from "../domain/command-registry.js";
+import { commandHelp, registeredCommandAction } from "../domain/command-registry.js";
 import type { TurnControl } from "../domain/turn-queue.js";
 import type { RunRecord, StateRepository } from "../ports/state-repository.js";
 import type { PresentationOptions } from "./presentation-factory.js";
+import type { SessionCatalogService } from "./session-catalog-service.js";
 
 export interface ControlCenterView {
   content: string;
@@ -29,30 +25,36 @@ function runLabel(run: RunRecord | undefined): string {
 
 export class ControlCenterService {
   public constructor(
-    private readonly config: HubConfig,
     private readonly store: StateRepository,
-    private readonly turns: TurnControl
+    private readonly turns: TurnControl,
+    private readonly sessions: SessionCatalogService
   ) {}
 
-  public home(scopeKey: string): ControlCenterView {
+  public async home(scopeKey: string): Promise<ControlCenterView> {
+    const project = await this.sessions.selectedProject(scopeKey);
     const link = this.store.getConversation(scopeKey);
-    const cwd = this.store.getWorkspace(scopeKey) ?? link?.cwd ?? this.config.workspace.defaultRoot;
     const queue = this.turns.snapshot(scopeKey);
     const latestRun = this.store.getLatestRun(scopeKey);
+    const pending = this.store.getPendingPrompt(scopeKey, Date.now());
     const running = queue.active;
+    const unclassifiedCount = (await this.sessions.snapshot()).unclassified.length;
     const actions = running || queue.pending > 0
       ? [
           registeredCommandAction("运行状态", "status", "", "primary"),
           registeredCommandAction("查看队列", "queue"),
           registeredCommandAction("停止任务", "cancel", "", "danger"),
-          registeredCommandAction("历史会话", "sessions"),
-          registeredCommandAction("最近对话", "history")
+          registeredCommandAction("当前会话", "history")
         ]
       : [
-          registeredCommandAction("历史会话", "sessions", "", "primary"),
+          project
+            ? registeredCommandAction("项目会话", "sessions", "", "primary")
+            : registeredCommandAction("选择项目", "projects", "", "primary"),
+          registeredCommandAction("项目中心", "projects"),
+          ...(unclassifiedCount
+            ? [registeredCommandAction(`未归类 ${unclassifiedCount}`, "unclassified")]
+            : []),
           registeredCommandAction("最近对话", "history"),
           registeredCommandAction("新建会话", "new"),
-          registeredCommandAction("切换项目", "workspace"),
           registeredCommandAction("运行状态", "status"),
           registeredCommandAction("飞书工具", "tools")
         ];
@@ -61,17 +63,28 @@ export class ControlCenterService {
         ? "Codex 正在处理任务。你可以查看进度、追加指令或停止任务。"
         : queue.pending > 0
           ? "Codex 当前有排队任务，新的普通消息会继续进入持久化队列。"
-          : "直接发送需求即可继续当前会话；也可以从下面选择会话、项目或工具。",
+          : !project
+            ? pending
+              ? "有一条消息正在等待选择项目和会话，普通消息暂时不会执行。"
+              : "请先选择项目，然后选择已有会话或在项目中创建新会话。"
+            : "直接发送需求即可继续当前会话，也可以切换项目或会话。",
       options: {
         title: "Codex 控制中心",
         kind: "help",
-        tone: running || queue.pending > 0 ? "warning" : "info",
-        status: running ? "执行中" : queue.pending > 0 ? `排队 ${queue.pending}` : "空闲",
-        subtitle: basename(cwd) || cwd,
+        tone: running || queue.pending > 0 || !project ? "warning" : "info",
+        status: running
+          ? "执行中"
+          : queue.pending > 0
+            ? `排队 ${queue.pending}`
+            : project
+              ? "空闲"
+              : "未选择项目",
+        subtitle: project?.name ?? "等待选择项目",
         fields: [
-          { label: "当前项目", value: basename(cwd) || cwd },
-          { label: "工作目录", value: cwd },
-          { label: "当前会话", value: link?.sessionId ? `${link.sessionId.slice(0, 8)}…` : "下条消息新建" },
+          { label: "当前项目", value: project?.name ?? "未选择" },
+          { label: "项目目录", value: project?.cwd ?? "—" },
+          { label: "当前会话", value: link?.sessionId ? `${link.sessionId.slice(0, 8)}…` : project ? "下条消息新建" : "—" },
+          { label: "暂存消息", value: pending ? "等待确认" : "无" },
           { label: "最近运行", value: runLabel(latestRun) },
           { label: "排队消息", value: String(queue.pending) }
         ],

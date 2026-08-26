@@ -111,3 +111,22 @@ export interface AgentThreadPage {
   threads: AgentThreadSummary[];
   nextCursor?: string;
 }
+
+export type UnclassifiedReason =
+  | "missing_cwd"
+  | "missing_directory"
+  | "unsafe_directory"
+  | "unsupported_source";
+
+export interface CodexProjectSummary {
+  key: string;
+  name: string;
+  cwd: string;
+  sessionCount: number;
+  updatedAt: number;
+}
+
+export interface UnclassifiedThread extends AgentThreadSummary {
+  reason: UnclassifiedReason;
+  reasonDetail: string;
+}

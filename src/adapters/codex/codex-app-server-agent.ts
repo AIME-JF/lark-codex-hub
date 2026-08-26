@@ -3,6 +3,7 @@ import type {
   AgentThreadDetails,
   AgentThreadListRequest,
   AgentThreadPage,
+  AgentThreadSummary,
   ExecutionEvent,
   ExecutionRequest,
   ExecutionResult
@@ -26,6 +27,7 @@ import {
   toThreadSummary,
   type JsonRecord,
   type RpcInboundMessage,
+  type StableThreadForkParams,
   type StableThreadResumeParams,
   type StableThreadStartParams
 } from "./app-server-protocol.js";
@@ -235,6 +237,18 @@ export class CodexAppServerAgent implements CodingAgent {
       });
       const thread = record(result)?.thread;
       return toThreadDetails(thread);
+    });
+  }
+
+  public async forkThread(threadId: string): Promise<AgentThreadSummary> {
+    return this.withOperation(async () => {
+      await this.ensureReady();
+      const params = { threadId } satisfies StableThreadForkParams;
+      const result = await this.client.request<unknown>("thread/fork", params);
+      const thread = record(result)?.thread;
+      const forked = toThreadSummary(thread);
+      this.loadedThreads.add(forked.id);
+      return forked;
     });
   }
 

@@ -70,17 +70,23 @@ export class CodexRunService {
     const now = Date.now();
     const leaseMs = this.config.runtime.leaseSeconds * 1_000;
     const link = this.store.getConversation(scopeKey);
-    const requestedCwd =
-      this.store.getWorkspace(scopeKey) ??
-      link?.cwd ??
-      this.config.workspace.defaultRoot;
+    const requestedCwd = this.store.getProject(scopeKey) ?? link?.cwd;
+    if (!requestedCwd) {
+      const detail = "尚未选择项目，消息没有执行。";
+      this.deliveries.enqueueReply(
+        message.messageId,
+        presentation("请先从项目中心选择项目和会话。", {
+          title: "需要选择项目",
+          tone: "warning",
+          status: "未执行"
+        }),
+        { idempotencyKey: `${message.eventId}:missing-project` }
+      );
+      return { state: "failed", terminalDeliveryQueued: false, error: detail };
+    }
     let cwd: string;
     try {
-      cwd = await this.workspaces.resolveAllowed(
-        requestedCwd,
-        requestedCwd,
-        this.config.workspace.allowedRoots
-      );
+      cwd = await this.workspaces.resolveProject(requestedCwd);
     } catch (error) {
       const detail = errorMessage(error);
       this.deliveries.enqueueReply(

@@ -17,6 +17,8 @@ import { ReactionProgressService } from "../application/reaction-progress.js";
 import { CodexRunService } from "../application/codex-run-service.js";
 import { ControlCenterService } from "../application/control-center-service.js";
 import { LiveCardService } from "../application/live-card-service.js";
+import { ProjectCatalogService } from "../application/project-catalog-service.js";
+import { ProjectNavigationService } from "../application/project-navigation-service.js";
 import { SessionCatalogService } from "../application/session-catalog-service.js";
 import { TurnQueueService } from "../application/turn-queue-service.js";
 import { createLogger, type Logger } from "../observability/logger.js";
@@ -96,18 +98,18 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
     logger
   );
   const workspaces = new NodeWorkspaceResolver();
-  await workspaces.resolveAllowed(
-    config.workspace.defaultRoot,
-    config.workspace.defaultRoot,
-    config.workspace.allowedRoots
+  const projectCatalog = new ProjectCatalogService(
+    agent,
+    workspaces,
+    config.projects.sourceKinds,
+    config.projects.cacheSeconds * 1_000
   );
   const sessions = new SessionCatalogService(
     agent,
     store,
-    workspaces,
-    config.workspace.defaultRoot,
-    config.workspace.allowedRoots
+    projectCatalog
   );
+  const navigation = new ProjectNavigationService(sessions, store);
   const codexRuns = new CodexRunService(
     config,
     agent,
@@ -127,7 +129,7 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
     config.runtime.maxConcurrentTurns,
     logger
   );
-  const controlCenter = new ControlCenterService(config, store, turns);
+  const controlCenter = new ControlCenterService(store, turns, sessions);
   const controller = new HubController(
     config,
     agent,
@@ -137,7 +139,7 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
     deliveries,
     turns,
     sessions,
-    workspaces,
+    navigation,
     controlCenter,
     logger
   );
@@ -182,7 +184,7 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
   inbound.start();
   logger.info("Lark Codex Hub 已启动", {
     owner: config.feishu.ownerOpenId,
-    workspace: config.workspace.defaultRoot
+    projectSources: config.projects.sourceKinds
   });
 
   let closed = false;

@@ -11,6 +11,7 @@ import { scheduledTaskStatus } from "../adapters/windows/scheduled-task.js";
 import { resolveCommand } from "../adapters/process/command-resolver.js";
 import { NodeWorkspaceResolver } from "../adapters/fs/node-workspace-resolver.js";
 import { CodexAppServerAgent } from "../adapters/codex/codex-app-server-agent.js";
+import { ProjectCatalogService } from "../application/project-catalog-service.js";
 import type { Logger } from "../observability/logger.js";
 
 const quietLogger: Logger = {
@@ -66,7 +67,7 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
   let config;
   try {
     config = await new FileConfigStore(home).load();
-    checks.push({ name: "配置", ok: true, detail: "config.v2.json 有效" });
+    checks.push({ name: "配置", ok: true, detail: "config.v3.json 有效" });
   } catch (error) {
     checks.push({ name: "配置", ok: false, detail: String(error) });
     return checks;
@@ -83,17 +84,6 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
     });
   } catch (error) {
     checks.push({ name: "密钥", ok: false, detail: String(error) });
-  }
-
-  try {
-    const workspace = await new NodeWorkspaceResolver().resolveAllowed(
-      config.workspace.defaultRoot,
-      config.workspace.defaultRoot,
-      config.workspace.allowedRoots
-    );
-    checks.push({ name: "工作目录", ok: true, detail: workspace });
-  } catch (error) {
-    checks.push({ name: "工作目录", ok: false, detail: String(error) });
   }
 
   try {
@@ -116,15 +106,16 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
       if (!health.ready) {
         throw new Error(health.detail);
       }
-      const threads = await agent.listThreads({
-        limit: 1,
-        sourceKinds: ["cli", "vscode", "exec", "appServer"],
-        useStateDbOnly: true
-      });
+      const catalog = await new ProjectCatalogService(
+        agent,
+        new NodeWorkspaceResolver(),
+        config.projects.sourceKinds,
+        config.projects.cacheSeconds * 1_000
+      ).snapshot(true);
       checks.push({
         name: "Codex App Server",
         ok: true,
-        detail: `${health.detail}；只读会话探测 ${threads.threads.length} 条；未执行真实 Turn`
+        detail: `${health.detail}；发现 ${catalog.projects.length} 个项目、${catalog.unclassified.length} 个未归类会话；未执行真实 Turn`
       });
     } catch (error) {
       checks.push({ name: "Codex App Server", ok: false, detail: String(error) });
@@ -142,8 +133,6 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
         'approval_policy="never"',
         "--sandbox",
         config.codex.sandbox,
-        "--cd",
-        config.workspace.defaultRoot,
         "resume",
         "--help"
       ]);

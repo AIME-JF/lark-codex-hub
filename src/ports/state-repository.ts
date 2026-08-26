@@ -1,4 +1,4 @@
-import type { ConversationLink } from "../contracts/events.js";
+import type { ConversationLink, InboundMessage } from "../contracts/events.js";
 import type { ReactionEmoji } from "../contracts/presentation.js";
 import type {
   DeliveryRecord,
@@ -61,6 +61,14 @@ export interface TurnLaneRecord {
   scopeKey: string;
 }
 
+export interface PendingPromptRecord {
+  scopeKey: string;
+  message: InboundMessage;
+  prompt: string;
+  expiresAt: number;
+  createdAt: number;
+}
+
 export interface StateRepository {
   migrate(): void;
   close(): void;
@@ -76,8 +84,17 @@ export interface StateRepository {
   listConversations(scopeKey: string, limit: number): ConversationLink[];
   bindConversation(link: ConversationLink): void;
   clearConversation(scopeKey: string): void;
+  getProject(scopeKey: string): string | undefined;
+  setProject(scopeKey: string, cwd: string, now: number): void;
+  clearProject(scopeKey: string): void;
+  /** @deprecated 使用 getProject。 */
   getWorkspace(scopeKey: string): string | undefined;
+  /** @deprecated 使用 setProject。 */
   setWorkspace(scopeKey: string, cwd: string, now: number): void;
+  savePendingPrompt(record: PendingPromptRecord): void;
+  getPendingPrompt(scopeKey: string, now: number): PendingPromptRecord | undefined;
+  consumePendingPrompt(scopeKey: string, now: number): PendingPromptRecord | undefined;
+  clearPendingPrompt(scopeKey: string): void;
   rememberP2pScope(openId: string, scopeKey: string, now: number): void;
   resolveP2pScope(openId: string): string | undefined;
   acquireLease(scopeKey: string, holder: string, now: number, ttlMs: number): boolean;

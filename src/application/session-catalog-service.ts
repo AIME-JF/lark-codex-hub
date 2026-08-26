@@ -2,22 +2,19 @@ import type {
   AgentThreadDetails,
   AgentThreadSource,
   AgentThreadSummary,
-  ConversationLink
+  ConversationLink,
+  UnclassifiedThread
 } from "../contracts/events.js";
 import type { CodingAgent } from "../ports/coding-agent.js";
 import type { StateRepository } from "../ports/state-repository.js";
-import type { WorkspaceResolver } from "../ports/workspace-resolver.js";
-
-const DIRECT_SOURCES = ["cli", "vscode", "exec", "appServer"] as const;
-const PAGE_SIZE = 100;
-const MAX_PAGES = 10;
+import type {
+  CodexProject,
+  ProjectCatalogService,
+  ProjectCatalogSnapshot
+} from "./project-catalog-service.js";
 
 export interface SessionCatalogEntry extends AgentThreadSummary {
   current: boolean;
-}
-
-function isDirectSource(source: AgentThreadSource): boolean {
-  return DIRECT_SOURCES.includes(source as (typeof DIRECT_SOURCES)[number]);
 }
 
 export function threadSourceLabel(source: AgentThreadSource): string {
@@ -25,7 +22,7 @@ export function threadSourceLabel(source: AgentThreadSource): string {
     cli: "Codex CLI",
     vscode: "Desktop / VS Code",
     exec: "旧版 Exec",
-    appServer: "App Server",
+    appServer: "Hub / App Server",
     unknown: "未知来源"
   };
   return labels[source];
@@ -46,141 +43,144 @@ export class SessionCatalogService {
   public constructor(
     private readonly agent: CodingAgent,
     private readonly store: StateRepository,
-    private readonly workspaces: WorkspaceResolver,
-    private readonly defaultRoot: string,
-    private readonly allowedRoots: readonly string[]
+    private readonly catalog: ProjectCatalogService
   ) {}
 
-  public async list(scopeKey: string, limit: number): Promise<SessionCatalogEntry[]> {
-    const current = this.store.getConversation(scopeKey);
-    if (!this.agent.listThreads) {
-      return this.listHubHistory(scopeKey, limit, current?.sessionId);
-    }
-
-    const entries: SessionCatalogEntry[] = [];
-    const seen = new Set<string>();
-    let cursor: string | undefined;
-    for (let pageIndex = 0; pageIndex < MAX_PAGES && entries.length < limit; pageIndex += 1) {
-      const page = await this.agent.listThreads({
-        limit: PAGE_SIZE,
-        ...(cursor ? { cursor } : {}),
-        sourceKinds: DIRECT_SOURCES,
-        useStateDbOnly: false
-      });
-      const validated = await Promise.all(
-        page.threads.map(async (thread) => {
-          try {
-            return await this.validate(thread);
-          } catch {
-            return undefined;
-          }
-        })
-      );
-      for (const thread of validated) {
-        if (!thread || seen.has(thread.id)) {
-          continue;
-        }
-        seen.add(thread.id);
-        entries.push({ ...thread, current: thread.id === current?.sessionId });
-        if (entries.length >= limit) {
-          break;
-        }
-      }
-      cursor = page.nextCursor;
-      if (!cursor) {
-        break;
-      }
-    }
-
-    if (current && !seen.has(current.sessionId) && this.agent.readThread) {
-      try {
-        const thread = await this.resolveThread(scopeKey, current.sessionId);
-        entries.unshift({ ...thread, current: true });
-      } catch {
-        // 已失效或越过白名单的旧绑定不进入全局会话目录。
-      }
-    }
-    return entries.slice(0, limit);
+  public snapshot(force = false): Promise<ProjectCatalogSnapshot> {
+    return this.catalog.snapshot(force);
   }
 
-  public async bind(scopeKey: string, idOrPosition: string): Promise<ConversationLink> {
+  public async selectedProject(scopeKey: string): Promise<CodexProject | undefined> {
+    const preferred = this.store.getProject(scopeKey);
+    if (preferred) {
+      const project = await this.catalog.projectByCwd(preferred);
+      if (project) {
+        return project;
+      }
+      this.store.clearProject(scopeKey);
+    }
+    const link = this.store.getConversation(scopeKey);
+    if (!link) {
+      return undefined;
+    }
+    const project = await this.catalog.projectByCwd(link.cwd);
+    if (!project) {
+      this.store.clearConversation(scopeKey);
+      return undefined;
+    }
+    this.store.setProject(scopeKey, project.cwd, Date.now());
+    return project;
+  }
+
+  public async selectProject(scopeKey: string, projectKey: string): Promise<CodexProject> {
+    const project = await this.catalog.project(projectKey);
+    if (!project) {
+      throw new Error("项目已经失效，请刷新项目列表。");
+    }
+    this.store.setProject(scopeKey, project.cwd, Date.now());
+    this.store.clearConversation(scopeKey);
+    return project;
+  }
+
+  public async listProjectSessions(
+    scopeKey: string,
+    projectKey: string
+  ): Promise<SessionCatalogEntry[]> {
+    const project = await this.catalog.project(projectKey);
+    if (!project) {
+      throw new Error("没有找到该项目，请刷新项目列表。");
+    }
+    const current = this.store.getConversation(scopeKey)?.sessionId;
+    return project.sessions.map((thread) => ({
+      ...thread,
+      current: thread.id === current
+    }));
+  }
+
+  public async bind(
+    scopeKey: string,
+    idOrPosition: string,
+    projectKey?: string
+  ): Promise<ConversationLink> {
+    const project = projectKey
+      ? await this.catalog.project(projectKey)
+      : await this.selectedProject(scopeKey);
+    if (!project) {
+      throw new Error("请先选择项目。");
+    }
     const position = /^\d+$/u.test(idOrPosition)
       ? Number.parseInt(idOrPosition, 10)
       : Number.NaN;
     const selected = Number.isInteger(position) && position > 0
-      ? (await this.list(scopeKey, 100))[position - 1]
-      : await this.resolveThread(scopeKey, idOrPosition);
+      ? project.sessions[position - 1]
+      : project.sessions.find((thread) => thread.id === idOrPosition);
     if (!selected) {
-      throw new Error("全局会话列表中没有找到该会话。");
+      throw new Error("所选会话不属于当前项目，请刷新会话列表。");
     }
     const link: ConversationLink = {
       scopeKey,
       sessionId: selected.id,
-      cwd: selected.cwd,
+      cwd: project.cwd,
       updatedAt: Date.now()
     };
     this.store.bindConversation(link);
-    this.store.setWorkspace(scopeKey, selected.cwd, link.updatedAt);
+    this.store.setProject(scopeKey, project.cwd, link.updatedAt);
     return link;
   }
 
-  private async resolveThread(
+  public async startNew(scopeKey: string, projectKey?: string): Promise<CodexProject> {
+    const project = projectKey
+      ? await this.catalog.project(projectKey)
+      : await this.selectedProject(scopeKey);
+    if (!project) {
+      throw new Error("请先选择项目。");
+    }
+    this.store.setProject(scopeKey, project.cwd, Date.now());
+    this.store.clearConversation(scopeKey);
+    return project;
+  }
+
+  public async migrate(
     scopeKey: string,
-    threadId: string
-  ): Promise<AgentThreadDetails> {
-    if (!threadId) {
-      throw new Error("缺少 Codex 会话 ID。");
+    threadId: string,
+    projectKey: string
+  ): Promise<ConversationLink> {
+    const snapshot = await this.catalog.snapshot();
+    const source = snapshot.unclassified.find((thread) => thread.id === threadId);
+    if (!source) {
+      throw new Error("未归类会话已经失效，请刷新列表。");
     }
-    if (!this.agent.readThread) {
-      const historical = this.store
-        .listConversations(scopeKey, 100)
-        .find((item) => item.sessionId === threadId);
-      if (!historical) {
-        throw new Error("当前执行后端不支持读取全局会话。");
-      }
-      return this.historyDetails(historical);
+    if (source.status === "active") {
+      throw new Error("该会话正在执行，完成后才能迁入项目。");
     }
-    const thread = await this.agent.readThread(threadId, false);
-    return this.validate(thread);
-  }
-
-  private async validate<T extends AgentThreadSummary>(thread: T): Promise<T> {
-    if (!isDirectSource(thread.source)) {
-      throw new Error(`不允许绑定 ${threadSourceLabel(thread.source)} 会话。`);
+    const project = snapshot.projects.find((item) => item.key === projectKey);
+    if (!project) {
+      throw new Error("目标项目已经失效，请刷新项目列表。");
     }
-    if (!thread.cwd) {
-      throw new Error("Codex 会话没有可验证的工作目录。");
+    if (!this.agent.forkThread) {
+      throw new Error("当前 Codex 后端不支持安全分叉会话。");
     }
-    const cwd = await this.workspaces.resolveAllowed(
-      thread.cwd,
-      this.defaultRoot,
-      this.allowedRoots
-    );
-    return { ...thread, cwd };
-  }
-
-  private listHubHistory(
-    scopeKey: string,
-    limit: number,
-    currentSessionId: string | undefined
-  ): SessionCatalogEntry[] {
-    return this.store.listConversations(scopeKey, limit).map((item) => ({
-      ...this.historyDetails(item),
-      current: item.sessionId === currentSessionId
-    }));
-  }
-
-  private historyDetails(item: ConversationLink): AgentThreadDetails {
-    return {
-      id: item.sessionId,
-      sessionId: item.sessionId,
-      source: "exec",
-      preview: "",
-      cwd: item.cwd,
-      status: "unknown",
-      createdAt: item.updatedAt,
-      updatedAt: item.updatedAt,
-      messages: []
+    const forked = await this.agent.forkThread(source.id);
+    const link: ConversationLink = {
+      scopeKey,
+      sessionId: forked.id,
+      cwd: project.cwd,
+      updatedAt: Date.now()
     };
+    this.store.bindConversation(link);
+    this.store.setProject(scopeKey, project.cwd, link.updatedAt);
+    this.catalog.invalidate();
+    return link;
+  }
+
+  public async unclassified(): Promise<UnclassifiedThread[]> {
+    return (await this.catalog.snapshot()).unclassified;
+  }
+
+  public async readThread(threadId: string): Promise<AgentThreadDetails> {
+    if (!this.agent.readThread) {
+      throw new Error("当前 Codex 后端不支持读取全局会话。");
+    }
+    return this.agent.readThread(threadId, true);
   }
 }

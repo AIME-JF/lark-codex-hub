@@ -37,6 +37,10 @@ export interface StableThreadResumeParams extends StableThreadConfig {
   threadId: string;
 }
 
+export interface StableThreadForkParams {
+  threadId: string;
+}
+
 export function stableThreadConfig(request: ExecutionRequest): StableThreadConfig {
   return {
     cwd: request.cwd,

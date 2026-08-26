@@ -21,7 +21,6 @@ import { startRuntime } from "../composition/runtime.js";
 import { runDoctor } from "./doctor.js";
 import { errorMessage } from "../observability/logger.js";
 import { presentation } from "../application/presentation-factory.js";
-import { NodeWorkspaceResolver } from "../adapters/fs/node-workspace-resolver.js";
 
 const args = process.argv.slice(2);
 
@@ -46,43 +45,25 @@ async function setup(home: string): Promise<void> {
   let appId: string | undefined;
   let appSecret: string | undefined;
   let ownerOpenId: string | undefined;
-  let workspace: string | undefined;
-  let allowedRoots: string[] | undefined;
 
   const sourceFromEnv = hasFlag("--from-env");
   if (sourceFromEnv) {
     appId = process.env.LARK_APP_ID;
     appSecret = process.env.LARK_APP_SECRET;
     ownerOpenId = flag("--owner");
-    workspace = flag("--workspace");
-    const allowRoot = flag("--allow-root");
-    allowedRoots = allowRoot ? [allowRoot] : undefined;
   } else if (hasFlag("--from-stdin")) {
     const input = JSON.parse(await stdinText()) as Record<string, unknown>;
     appId = typeof input.appId === "string" ? input.appId : undefined;
     appSecret = typeof input.appSecret === "string" ? input.appSecret : undefined;
     ownerOpenId = typeof input.ownerOpenId === "string" ? input.ownerOpenId : undefined;
-    workspace = typeof input.workspace === "string" ? input.workspace : undefined;
-    allowedRoots = Array.isArray(input.allowedRoots)
-      ? input.allowedRoots.filter((item): item is string => typeof item === "string")
-      : undefined;
   } else {
     throw new Error("setup 需要 --from-env 或 --from-stdin，避免在命令行中暴露密钥。");
   }
 
-  if (!appId || !appSecret || !ownerOpenId || !workspace) {
-    throw new Error("缺少 App ID、App Secret、ownerOpenId 或 workspace。");
+  if (!appId || !appSecret || !ownerOpenId) {
+    throw new Error("缺少 App ID、App Secret 或 ownerOpenId。");
   }
-  const workspacePath = resolve(workspace);
-  const config = createDefaultConfig(ownerOpenId, workspacePath);
-  if (allowedRoots && allowedRoots.length > 0) {
-    config.workspace.allowedRoots = allowedRoots.map((item) => resolve(item));
-    await new NodeWorkspaceResolver().resolveAllowed(
-      workspacePath,
-      workspacePath,
-      config.workspace.allowedRoots
-    );
-  }
+  const config = createDefaultConfig(ownerOpenId);
   delete process.env.LARK_APP_ID;
   delete process.env.LARK_APP_SECRET;
   const persistentVault = createSecretVault(home);
@@ -142,7 +123,8 @@ async function status(home: string): Promise<void> {
     `${JSON.stringify(
       {
         ownerOpenId: config.feishu.ownerOpenId,
-        defaultWorkspace: config.workspace.defaultRoot,
+        configVersion: config.schemaVersion,
+        projectSources: config.projects.sourceKinds,
         scheduledTask: task,
         database: health
       },
@@ -243,7 +225,7 @@ function usage(): void {
   process.stdout.write(`Lark Codex Hub
 
 用法：
-  lark-codex-hub setup --from-env --owner <open_id> --workspace <目录> [--allow-root <根目录>]
+  lark-codex-hub setup --from-env --owner <open_id>
   lark-codex-hub setup --from-stdin
   lark-codex-hub start
   lark-codex-hub doctor

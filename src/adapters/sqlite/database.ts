@@ -40,6 +40,22 @@ CREATE TABLE IF NOT EXISTS workspace_preferences (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS project_preferences (
+  scope_key TEXT PRIMARY KEY,
+  cwd TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pending_prompts (
+  scope_key TEXT PRIMARY KEY,
+  message_json TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pending_prompts_expiry_idx
+  ON pending_prompts(expires_at);
+
 CREATE TABLE IF NOT EXISTS p2p_scopes (
   open_id TEXT PRIMARY KEY,
   scope_key TEXT NOT NULL,
@@ -308,6 +324,19 @@ function migrateToVersion6(database: Database.Database): void {
     .run(Date.now());
 }
 
+function migrateLegacyProjectPreferences(database: Database.Database): void {
+  const legacy = database
+    .prepare("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = 'workspace_preferences'")
+    .get() as { found: number } | undefined;
+  if (legacy) {
+    database.exec(`
+      INSERT OR IGNORE INTO project_preferences(scope_key, cwd, updated_at)
+        SELECT scope_key, cwd, updated_at FROM workspace_preferences;
+      DELETE FROM workspace_preferences;
+    `);
+  }
+}
+
 export function openDatabase(path: string): Database.Database {
   mkdirSync(dirname(path), { recursive: true });
   const database = new Database(path);
@@ -350,5 +379,6 @@ export function migrateDatabase(database: Database.Database): void {
       migrateToVersion6(database);
     }
     database.exec(latestSchema);
+    migrateLegacyProjectPreferences(database);
   })();
 }

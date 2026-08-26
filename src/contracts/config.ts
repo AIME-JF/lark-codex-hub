@@ -5,7 +5,7 @@ import { z } from "zod";
 const sandboxSchema = z.enum(["read-only", "workspace-write"]);
 
 export const hubConfigSchema = z.object({
-  schemaVersion: z.literal(2),
+  schemaVersion: z.literal(3),
   feishu: z.object({
     domain: z.enum(["feishu", "lark"]).default("feishu"),
     ownerOpenId: z.string().min(1),
@@ -20,9 +20,13 @@ export const hubConfigSchema = z.object({
     model: z.string().min(1).optional(),
     timeoutMinutes: z.number().int().min(1).max(240).default(60)
   }),
-  workspace: z.object({
-    defaultRoot: z.string().min(1),
-    allowedRoots: z.array(z.string().min(1)).min(1)
+  projects: z.object({
+    sourceKinds: z
+      .array(z.enum(["vscode", "appServer"]))
+      .min(1)
+      .default(["vscode", "appServer"]),
+    cacheSeconds: z.number().int().min(5).max(300).default(30),
+    pendingPromptMinutes: z.number().int().min(1).max(240).default(30)
   }),
   larkCli: z.object({
     enabled: z.boolean().default(true),
@@ -62,10 +66,12 @@ export function defaultHome(): string {
     : resolve(homedir(), ".lark-codex-hub");
 }
 
-export function createDefaultConfig(ownerOpenId: string, workspaceRoot: string): HubConfig {
-  const root = resolve(workspaceRoot);
+export function createDefaultConfig(
+  ownerOpenId: string,
+  _legacyWorkspaceRoot?: string
+): HubConfig {
   return hubConfigSchema.parse({
-    schemaVersion: 2,
+    schemaVersion: 3,
     feishu: {
       domain: "feishu",
       ownerOpenId,
@@ -79,9 +85,10 @@ export function createDefaultConfig(ownerOpenId: string, workspaceRoot: string):
       sandbox: "workspace-write",
       timeoutMinutes: 60
     },
-    workspace: {
-      defaultRoot: root,
-      allowedRoots: [root]
+    projects: {
+      sourceKinds: ["vscode", "appServer"],
+      cacheSeconds: 30,
+      pendingPromptMinutes: 30
     },
     larkCli: {
       enabled: true,

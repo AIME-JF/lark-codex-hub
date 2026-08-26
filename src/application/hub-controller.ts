@@ -17,7 +17,6 @@ import { errorMessage } from "../observability/logger.js";
 import type { ActionBroker } from "../ports/action-broker.js";
 import type { CodingAgent } from "../ports/coding-agent.js";
 import type { StateRepository } from "../ports/state-repository.js";
-import type { WorkspaceResolver } from "../ports/workspace-resolver.js";
 import { CommandRouter, type CommandContext } from "./command-router.js";
 import type { ControlCenterService } from "./control-center-service.js";
 import type { DeliveryWorker } from "./delivery-worker.js";
@@ -27,12 +26,14 @@ import {
 } from "./lark-action-service.js";
 import { presentation, resultPresentation } from "./presentation-factory.js";
 import type { ReactionProgressService } from "./reaction-progress.js";
+import type { ProjectNavigationService } from "./project-navigation-service.js";
 import type { SessionCatalogService } from "./session-catalog-service.js";
 
 export class HubController {
   private readonly accessPolicy: AccessPolicy;
   private readonly commands: CommandRouter;
   private readonly larkActions: LarkActionService;
+  private readonly pendingPromptTtlMs: number;
 
   public constructor(
     config: HubConfig,
@@ -42,12 +43,13 @@ export class HubController {
     reactions: ReactionProgressService,
     private readonly deliveries: DeliveryWorker,
     private readonly turns: TurnControl,
-    sessions: SessionCatalogService,
-    workspaces: WorkspaceResolver,
+    private readonly sessions: SessionCatalogService,
+    navigation: ProjectNavigationService,
     controlCenter: ControlCenterService,
     logger: Logger
   ) {
     this.accessPolicy = new AccessPolicy(config.feishu);
+    this.pendingPromptTtlMs = config.projects.pendingPromptMinutes * 60_000;
     this.larkActions = new LarkActionService(
       actions,
       store,
@@ -56,12 +58,11 @@ export class HubController {
       logger
     );
     this.commands = new CommandRouter(
-      config,
       agent,
       store,
       sessions,
       turns,
-      workspaces,
+      navigation,
       controlCenter,
       (id, context) => this.larkActions.confirm(id, context),
       (id, context) => this.larkActions.reject(id, context)
@@ -135,6 +136,20 @@ export class HubController {
         return;
       }
     }
+    const project = await this.sessions.selectedProject(scopeKey);
+    if (!project) {
+      this.store.savePendingPrompt({
+        scopeKey,
+        message,
+        prompt: text,
+        createdAt: message.receivedAt,
+        expiresAt: message.receivedAt + this.pendingPromptTtlMs
+      });
+      await this.commands.handle(context, "/projects");
+      return;
+    }
+    // 用户在已经选定项目后发送了新消息，视为主动放弃此前暂存内容。
+    this.store.clearPendingPrompt(scopeKey);
     await this.turns.enqueue(message, scopeKey, text);
   }
 

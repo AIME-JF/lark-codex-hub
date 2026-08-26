@@ -3,6 +3,7 @@ import type {
   AgentThreadDetails,
   AgentThreadListRequest,
   AgentThreadPage,
+  AgentThreadSummary,
   ExecutionEvent,
   ExecutionRequest,
   ExecutionResult
@@ -18,6 +19,7 @@ export interface CodingAgent {
   health?(): Promise<AgentHealth>;
   listThreads?(request: AgentThreadListRequest): Promise<AgentThreadPage>;
   readThread?(threadId: string, includeTurns: boolean): Promise<AgentThreadDetails>;
+  forkThread?(threadId: string): Promise<AgentThreadSummary>;
   activeScopes(): readonly string[];
   shutdown(graceMs: number): Promise<void>;
 }

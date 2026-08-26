@@ -19,6 +19,7 @@ import type {
   LiveCardRecord,
   OutboxRecord,
   PendingActionRecord,
+  PendingPromptRecord,
   RunRecord,
   StateRepository,
   TurnLaneRecord
@@ -109,6 +110,24 @@ interface RunRow {
   started_at: number;
   finished_at: number | null;
   error: string | null;
+}
+
+interface PendingPromptRow {
+  scope_key: string;
+  message_json: string;
+  prompt: string;
+  expires_at: number;
+  created_at: number;
+}
+
+function pendingPrompt(row: PendingPromptRow): PendingPromptRecord {
+  return {
+    scopeKey: row.scope_key,
+    message: JSON.parse(row.message_json) as PendingPromptRecord["message"],
+    prompt: row.prompt,
+    expiresAt: row.expires_at,
+    createdAt: row.created_at
+  };
 }
 
 function activeReaction(row: ActiveReactionRow): ActiveReactionRecord {
@@ -435,20 +454,77 @@ export class SqliteStateStore implements StateRepository {
     this.database.prepare("DELETE FROM conversation_links WHERE scope_key = ?").run(scopeKey);
   }
 
-  public getWorkspace(scopeKey: string): string | undefined {
+  public getProject(scopeKey: string): string | undefined {
     const row = this.database
-      .prepare("SELECT cwd FROM workspace_preferences WHERE scope_key = ?")
+      .prepare("SELECT cwd FROM project_preferences WHERE scope_key = ?")
       .get(scopeKey) as { cwd: string } | undefined;
     return row?.cwd;
   }
 
-  public setWorkspace(scopeKey: string, cwd: string, now: number): void {
+  public setProject(scopeKey: string, cwd: string, now: number): void {
     this.database
       .prepare(
-        `INSERT INTO workspace_preferences(scope_key, cwd, updated_at) VALUES(?, ?, ?)
+        `INSERT INTO project_preferences(scope_key, cwd, updated_at) VALUES(?, ?, ?)
          ON CONFLICT(scope_key) DO UPDATE SET cwd = excluded.cwd, updated_at = excluded.updated_at`
       )
       .run(scopeKey, cwd, now);
+  }
+
+  public clearProject(scopeKey: string): void {
+    this.database.prepare("DELETE FROM project_preferences WHERE scope_key = ?").run(scopeKey);
+  }
+
+  public getWorkspace(scopeKey: string): string | undefined {
+    return this.getProject(scopeKey);
+  }
+
+  public setWorkspace(scopeKey: string, cwd: string, now: number): void {
+    this.setProject(scopeKey, cwd, now);
+  }
+
+  public savePendingPrompt(record: PendingPromptRecord): void {
+    this.database
+      .prepare(
+        `INSERT INTO pending_prompts(scope_key, message_json, prompt, expires_at, created_at)
+         VALUES(?, ?, ?, ?, ?)
+         ON CONFLICT(scope_key) DO UPDATE SET
+           message_json = excluded.message_json,
+           prompt = excluded.prompt,
+           expires_at = excluded.expires_at,
+           created_at = excluded.created_at`
+      )
+      .run(
+        record.scopeKey,
+        JSON.stringify(record.message),
+        record.prompt,
+        record.expiresAt,
+        record.createdAt
+      );
+  }
+
+  public getPendingPrompt(scopeKey: string, now: number): PendingPromptRecord | undefined {
+    this.database.prepare("DELETE FROM pending_prompts WHERE expires_at <= ?").run(now);
+    const row = this.database
+      .prepare(
+        `SELECT scope_key, message_json, prompt, expires_at, created_at
+         FROM pending_prompts WHERE scope_key = ?`
+      )
+      .get(scopeKey) as PendingPromptRow | undefined;
+    return row ? pendingPrompt(row) : undefined;
+  }
+
+  public consumePendingPrompt(scopeKey: string, now: number): PendingPromptRecord | undefined {
+    return this.database.transaction(() => {
+      const record = this.getPendingPrompt(scopeKey, now);
+      if (record) {
+        this.clearPendingPrompt(scopeKey);
+      }
+      return record;
+    })();
+  }
+
+  public clearPendingPrompt(scopeKey: string): void {
+    this.database.prepare("DELETE FROM pending_prompts WHERE scope_key = ?").run(scopeKey);
   }
 
   public rememberP2pScope(openId: string, scopeKey: string, now: number): void {

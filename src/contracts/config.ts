@@ -5,7 +5,7 @@ import { z } from "zod";
 const sandboxSchema = z.enum(["read-only", "workspace-write"]);
 
 export const hubConfigSchema = z.object({
-  schemaVersion: z.literal(3),
+  schemaVersion: z.literal(5),
   feishu: z.object({
     domain: z.enum(["feishu", "lark"]).default("feishu"),
     ownerOpenId: z.string().min(1),
@@ -21,10 +21,6 @@ export const hubConfigSchema = z.object({
     timeoutMinutes: z.number().int().min(1).max(240).default(60)
   }),
   projects: z.object({
-    sourceKinds: z
-      .array(z.enum(["vscode", "appServer"]))
-      .min(1)
-      .default(["vscode", "appServer"]),
     cacheSeconds: z.number().int().min(5).max(300).default(30),
     pendingPromptMinutes: z.number().int().min(1).max(240).default(30)
   }),
@@ -71,7 +67,7 @@ export function createDefaultConfig(
   _legacyWorkspaceRoot?: string
 ): HubConfig {
   return hubConfigSchema.parse({
-    schemaVersion: 3,
+    schemaVersion: 5,
     feishu: {
       domain: "feishu",
       ownerOpenId,
@@ -86,7 +82,6 @@ export function createDefaultConfig(
       timeoutMinutes: 60
     },
     projects: {
-      sourceKinds: ["vscode", "appServer"],
       cacheSeconds: 30,
       pendingPromptMinutes: 30
     },

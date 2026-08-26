@@ -2,7 +2,7 @@
 
 [English](README.en.md) · [飞书配置](docs/FEISHU_SETUP.md) · [运维手册](docs/OPERATIONS.md) · [架构说明](ARCHITECTURE.md)
 
-![version](https://img.shields.io/badge/version-1.3.0-3370ff)
+![version](https://img.shields.io/badge/version-1.5.0-3370ff)
 ![platform](https://img.shields.io/badge/platform-Windows-0078d4)
 ![node](https://img.shields.io/badge/Node.js-%3E%3D22.12-339933)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -22,7 +22,7 @@
 - **进度一眼可见**：原消息依次显示思考、执行、输入、完成或失败表情。
 - **回复实时更新**：Codex 输出会持续写入同一张进度卡片，结束后原卡片切换为正式结果。
 - **连续消息不用重发**：执行中的新消息持久排队，短时间连续输入会自动合并，也可以用 `/steer` 追加到当前任务。
-- **默认收紧权限**：仅允许指定用户和会话，工作目录必须在白名单根目录内。
+- **默认收紧权限**：仅允许指定用户和会话，并拒绝系统目录、状态目录等危险工作区。
 - **开机静默运行**：通过 Windows 任务计划程序启动，不弹出容易误关的 CMD 窗口。
 - **一个控制中心完成操作**：命令菜单会根据空闲、排队或执行状态动态显示会话、项目、队列和停止按钮。
 
@@ -31,7 +31,7 @@
 | 能力 | 基础安装 | 说明 |
 | --- | :---: | --- |
 | 飞书远程调用 Codex App Server | ✅ | 全局会话发现、新建、续接、恢复、转向和取消会话 |
-| Desktop / VS Code 会话接续 | ✅ | 白名单目录内按来源发现和绑定；任务结束后释放 writer |
+| Codex CLI 全局会话接续 | ✅ | Desktop、VS Code、CLI 与飞书共享持久化会话；占用时安全交接 |
 | 流式 Card 2.0 回复 | ✅ | 单卡增量更新、Markdown、长内容分片、状态和 Token 信息 |
 | 进度与终态表情 | 可选 | 需要消息表情权限 |
 | 持久化与断电恢复 | ✅ | SQLite WAL、入站队列、Turn 队列、投递队列和幂等键 |
@@ -108,7 +108,6 @@ npm run check
 
 - 飞书应用的 App ID 和 App Secret。
 - 允许使用机器人的用户 `open_id`，格式通常为 `ou_xxx`。
-- Codex 默认工作目录和允许访问的根目录。
 
 凭据只通过临时环境变量进入安装程序，随后使用 Windows 当前用户的 DPAPI 加密保存：
 
@@ -117,14 +116,12 @@ $env:LARK_APP_ID = "cli_xxx"
 $env:LARK_APP_SECRET = "你的 App Secret"
 
 node .\dist\cli\index.js setup --from-env `
-  --owner "ou_xxx" `
-  --workspace "D:\你的项目目录" `
-  --allow-root "D:\允许 Codex 操作的根目录"
+  --owner "ou_xxx"
 
 Remove-Item Env:LARK_APP_ID, Env:LARK_APP_SECRET
 ```
 
-如果不使用 `lark-cli` 扩展，请打开 `%USERPROFILE%\.lark-codex-hub\config.v2.json`，将其关闭：
+如果不使用 `lark-cli` 扩展，请打开 `%USERPROFILE%\.lark-codex-hub\config.v5.json`，将其关闭：
 
 ```json
 {
@@ -177,16 +174,16 @@ node .\dist\cli\index.js service status
 | 命令 | 用途 |
 | --- | --- |
 | `/help`、`/hub` | 打开动态 Codex 控制中心 |
-| `/new` | 解除当前绑定，下一条消息创建新 Codex 会话 |
+| `/new` | 明确选择在当前项目创建新 Codex 会话 |
 | `/status` | 查看工作目录、session 和运行状态 |
-| `/sessions [页码]` | 分页查看白名单目录内的 Desktop、VS Code、CLI 与 Hub 全局会话 |
+| `/projects [页码或关键词]` | 浏览按工作目录归组的 Codex CLI 项目 |
+| `/sessions [页码]` | 分页查看当前项目内的全局 Codex 会话 |
 | `/history [页码]` | 分页查看当前 Codex 会话的用户与助手消息 |
 | `/resume <session_id>` | 绑定一个白名单内的全局会话；绑定本身不会占用 writer |
 | `/cancel` | 取消当前运行任务 |
 | `/queue` | 查看当前范围等待执行的消息 |
 | `/steer <补充指令>` | 把补充指令追加到当前运行中的 Turn |
-| `/workspace` | 查看当前工作目录 |
-| `/workspace <目录>` | 切换到白名单内的目录并新建会话 |
+| `/workspace` | `/projects` 的别名，打开项目中心 |
 | `/tools` | 查看飞书扩展工具和参数 |
 | `/send <bot\|user> <open_id\|chat_id> <ID> <内容>` | 通过 `lark-cli` 发送飞书消息 |
 | `/task <标题>` | 通过用户身份创建飞书任务 |
@@ -211,7 +208,7 @@ node .\dist\cli\index.js notify "构建已经完成"
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.v2.json` | 非敏感运行配置、用户和目录白名单 |
+| `config.v5.json` | 非敏感运行配置、用户和项目发现策略 |
 | `secrets.v2.json` | 当前 Windows 用户 DPAPI 加密的 App 凭据 |
 | `hub.sqlite*` | session、队列、租约、运行和确认状态 |
 | `logs\hub.log*` | 自动轮转并脱敏的结构化日志 |
@@ -223,7 +220,7 @@ node .\dist\cli\index.js notify "构建已经完成"
 
 - 默认只有 `ownerOpenId` 可以使用机器人。
 - 群聊默认必须提及机器人。
-- 工作目录在解析符号链接和 Windows Junction 后仍必须位于 `allowedRoots` 内。
+- 工作目录会解析符号链接和 Windows Junction，并拒绝用户主目录、系统目录和 Codex 状态目录等危险根目录。
 - Codex 只开放 `read-only` 或 `workspace-write`，项目不提供 `danger-full-access` 配置。
 - 子进程通过参数数组启动，不经过 shell。
 - 飞书扩展只接受固定动作 Schema，不提供原始 `lark-cli` 命令透传。
@@ -235,8 +232,9 @@ node .\dist\cli\index.js notify "构建已经完成"
 ## 已知限制
 
 - Codex App Server 命令和协议仍可能随 Codex CLI 版本演进；升级 Codex CLI 后应先运行 `doctor` 再重启服务。
-- Hub 已使用与富客户端相同的 Codex App Server 协议，但它仍是独立客户端进程。飞书 Turn 运行期间不能由 Desktop 或 VS Code 同时写入；Turn 结束后 Hub 会回收 App Server 子进程并释放 writer。绑定和只读查看不会加载会话。
-- 跨客户端共享的是持久历史，不是实时 UI 事件流；飞书完成后可能需要在 Desktop 或 VS Code 中刷新或重新打开会话。
+- Desktop、VS Code、CLI 和飞书共享的是 Codex 持久化历史，不是界面的实时消息镜像；本地列表偶尔需要刷新。
+- 同一个 thread 同一时间只能由一个 App Server writer 持有。Desktop、VS Code 或其他 CLI 已加载会话时，飞书会提示占用，绝不会自动创建替代会话。
+- Hub 的飞书 Turn 结束后会回收自己的 App Server，尽快释放 writer 给其他 Codex 客户端。
 - 服务停止期间收到的飞书事件取决于飞书事件投递策略，项目只能恢复已经落入本地 SQLite 的事件。
 - 被强制终止的 Codex 任务不会自动重跑，因为它可能已经修改过文件；重启后机器人会提示人工检查。
 - 当前只支持文本提示，不支持从飞书消息直接传递图片或附件给 Codex。

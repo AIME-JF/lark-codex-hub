@@ -30,7 +30,7 @@ node .\dist\cli\index.js service remove
 默认目录为 `%USERPROFILE%\.lark-codex-hub`。可通过 `LARK_CODEX_HUB_HOME` 使用隔离目录。
 
 ```text
-config.v2.json          非敏感配置、白名单和运行参数
+config.v5.json          非敏感配置、项目发现和运行参数
 secrets.v2.json         当前用户 DPAPI 加密的飞书凭据
 hub.sqlite              SQLite 主数据库
 hub.sqlite-wal          WAL 日志，服务运行时可能存在
@@ -52,9 +52,9 @@ node .\dist\cli\index.js service status
 
 `doctor` 会检查：
 
-- `config.v2.json` 是否符合配置 Schema。
+- `config.v5.json` 是否符合配置 Schema。
 - DPAPI 凭据是否能被当前 Windows 用户读取。
-- 默认工作目录的真实路径是否位于允许根目录内。
+- 已发现会话的真实工作目录是否可用且不属于危险根目录。
 - Codex CLI 版本、App Server 初始化以及只读 `thread/list` 是否可用。该检查不会执行真实 Turn，不能代替端到端消息验证。
 - 启用 `lark-cli` 时，机器人和用户身份是否可用。
 - SQLite schema、WAL 模式和 `integrity_check`。
@@ -125,13 +125,13 @@ DPAPI 凭据只能由创建它们的 Windows 用户在原 Windows 安全上下�
 
 如果 `doctor` 报告 SQLite 完整性不是 `ok`，请先停止服务并保存所有 `hub.sqlite*` 文件，再进行任何修复。
 
-## 与 Codex Desktop 共用 session
+## 与 Codex Desktop、VS Code 和 CLI 交接 session
 
-发送 `/sessions` 可以查看 `allowedRoots` 内的 Desktop、VS Code、CLI 和 Hub 全局会话；发送 `/resume <ID>` 或使用恢复按钮只会更新飞书绑定，不会加载 thread，也不会占用 writer。
+发送 `/projects` 和 `/sessions` 可以按工作目录查看 Codex 全局持久化会话；Desktop 保存的项目名称会作为可选显示别名。发送 `/resume <ID>` 或使用恢复按钮只更新飞书绑定，不会加载 thread，也不会占用 writer。
 
-真正发送普通消息时，Hub 才会恢复 thread 并取得 Codex writer。飞书 Turn 运行期间不要在 Desktop 或 VS Code 对同一会话发送任务；否则其中一端会收到会话正在使用的提示。最后一个飞书 Turn 完成、失败或取消后，Hub 会回收自己的 App Server 子进程，writer 随即释放，不需要等待线程的内存保留期。
+Desktop、VS Code、CLI 和 Hub 使用同一套 Codex 持久化历史，但各自拥有独立 App Server。同一个 thread 同一时间只能有一个 writer：本地客户端已经加载目标会话时，机器人会显示占用卡片；让本地客户端释放会话后点击“重新执行”即可重新入队，无需重新发送提示。
 
-三端共用的是持久历史，不是实时 UI 事件流。飞书完成后，如 Desktop 或 VS Code 已经打开该会话，可能需要刷新或重新打开才能看到新增内容。
+最后一个飞书 Turn 完成、失败或取消后，Hub 会回收自己的 App Server 并释放 writer。该交接不是界面实时镜像，其他客户端必要时需要刷新会话列表。
 
 ## 卸载
 
@@ -162,7 +162,7 @@ node .\dist\cli\index.js service remove
 ### 机器人回复“当前会话正忙”
 
 - 发送 `/status`，确认 App Server 的“基础连接”可用，并检查“最近执行”是否成功；基础连接可用不代表最近一条消息执行成功。
-- 检查 Codex Desktop 是否正在写入同一 session。
+- 检查 Codex Desktop、VS Code 或其他 Codex CLI 是否正在持有同一 session。
 - 发送 `/queue` 检查排队消息；同一范围的新消息会排队，不应再因 Hub 自身并发而失败。
 - Hub 租约有过期机制；服务异常退出后无需删除文件锁。
 

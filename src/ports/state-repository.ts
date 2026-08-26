@@ -69,6 +69,12 @@ export interface PendingPromptRecord {
   createdAt: number;
 }
 
+export interface NewSessionIntentRecord {
+  scopeKey: string;
+  cwd: string;
+  updatedAt: number;
+}
+
 export interface StateRepository {
   migrate(): void;
   close(): void;
@@ -84,6 +90,9 @@ export interface StateRepository {
   listConversations(scopeKey: string, limit: number): ConversationLink[];
   bindConversation(link: ConversationLink): void;
   clearConversation(scopeKey: string): void;
+  getNewSessionIntent(scopeKey: string): NewSessionIntentRecord | undefined;
+  setNewSessionIntent(record: NewSessionIntentRecord): void;
+  clearNewSessionIntent(scopeKey: string): void;
   getProject(scopeKey: string): string | undefined;
   setProject(scopeKey: string, cwd: string, now: number): void;
   clearProject(scopeKey: string): void;
@@ -105,6 +114,7 @@ export interface StateRepository {
   getLatestRun(scopeKey: string): RunRecord | undefined;
   interruptRunningRuns(now: number): number;
   enqueueTurnJob(record: TurnJobRecord): boolean;
+  getRetryableTurn(scopeKey: string, id?: string): TurnJobRecord | undefined;
   listReadyTurnLanes(before: number, limit: number): TurnLaneRecord[];
   claimTurnBatch(
     laneKey: string,

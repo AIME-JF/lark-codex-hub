@@ -103,6 +103,38 @@ export class TurnQueueService implements TurnControl {
     return this.store.countPendingTurns(scopeKey);
   }
 
+  public async retry(scopeKey: string, id?: string): Promise<number> {
+    if (this.activeScopes.has(scopeKey) || this.store.countPendingTurns(scopeKey) > 0) {
+      throw new Error("当前还有任务正在执行或排队，请等待完成后再重试。");
+    }
+    const source = this.store.getRetryableTurn(scopeKey, id);
+    if (!source) {
+      throw new Error("没有找到可重试的会话占用任务，可能已经重试过或任务已失效。");
+    }
+    const link = this.store.getConversation(scopeKey);
+    const eventId = `${source.eventId}:retry:${source.id}`;
+    const record: TurnJobRecord = {
+      id: randomUUID(),
+      eventId,
+      scopeKey,
+      laneKey: link?.sessionId ? `session:${link.sessionId}` : `scope:${scopeKey}`,
+      message: {
+        ...source.message,
+        eventId,
+        receivedAt: Date.now()
+      },
+      prompt: source.prompt,
+      state: "pending",
+      createdAt: Date.now()
+    };
+    if (!this.store.enqueueTurnJob(record)) {
+      throw new Error("这条任务已经重新进入过队列，请使用最新的失败卡片继续重试。");
+    }
+    await this.reactions.track(record.id, record.message.messageId).thinking();
+    this.kick();
+    return this.store.countPendingTurns(scopeKey);
+  }
+
   public async cancel(scopeKey: string): Promise<TurnCancelResult> {
     const pending = this.store.cancelPendingTurns(scopeKey, Date.now());
     await Promise.all(

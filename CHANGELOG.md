@@ -2,6 +2,43 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [1.5.0] - 2026-08-26
+
+### Added
+
+- Read-only Desktop project metadata aliases for Codex CLI working-directory groups.
+- A persistent explicit-new-session intent that separates `/new` from merely selecting a project.
+
+### Changed
+
+- Desktop, VS Code, CLI, and Hub sessions now use one global Codex CLI catalog and one recyclable Hub App Server execution path.
+- Configuration is schema v5 and automatically migrates v2-v4 files while preserving encrypted Feishu credentials and local policy.
+- Project selection now requires a second explicit choice: resume an existing thread or create a new one.
+
+### Removed
+
+- The unsupported VS Code `chatgpt.cliExecutable` wrapper, bridge socket, runtime router, integration commands, and related state.
+
+### Fixed
+
+- Selecting a project and then sending text can no longer silently call `thread/start`.
+- The VS Code extension is no longer broken by attempting to spawn a `.cmd` development override.
+
+## [1.4.0] - 2026-08-26
+
+### Added
+
+- A reversible VS Code Codex wrapper that exposes the existing App Server to Hub through an authenticated local named pipe.
+- Runtime routing that prefers a matching VS Code instance and waits for its active local turn instead of creating a competing writer.
+- Typed session-busy cards with owner-specific handoff guidance and a durable `/retry` action that requeues the original prompt.
+- VS Code integration install, status, remove, doctor checks, and shared-session labels in project navigation.
+
+### Changed
+
+- Runtime configuration is now schema v4 and migrates the previous v3 file without changing encrypted credentials or SQLite history.
+- App Server event mapping is shared by the bridge and fallback agents.
+- Desktop writer conflicts are reported separately from VS Code local-turn waiting.
+
 ## [1.3.0] - 2026-08-26
 
 ### Added
@@ -77,4 +114,5 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 [1.1.0]: https://github.com/AIME-JF/lark-codex-hub/commit/67f144ae40bb57a2ae0d2b09debad217d61961b4
 [1.2.0]: https://github.com/AIME-JF/lark-codex-hub/compare/v1.1.0...v1.2.0
-[1.3.0]: https://github.com/AIME-JF/lark-codex-hub/compare/v1.2.0...HEAD
+[1.3.0]: https://github.com/AIME-JF/lark-codex-hub/compare/v1.2.0...v1.3.0
+[1.4.0]: https://github.com/AIME-JF/lark-codex-hub/compare/v1.3.0...HEAD

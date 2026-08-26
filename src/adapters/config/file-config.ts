@@ -11,28 +11,43 @@ function migrateLegacyConfig(value: unknown): HubConfig {
     throw new Error("旧配置不是有效的 JSON 对象。");
   }
   const legacy = value as Record<string, unknown>;
-  if (legacy.schemaVersion !== 2) {
+  if (
+    legacy.schemaVersion !== 2 &&
+    legacy.schemaVersion !== 3 &&
+    legacy.schemaVersion !== 4
+  ) {
     throw new Error(`不支持的配置版本：${String(legacy.schemaVersion)}`);
   }
-  const { workspace: _workspace, schemaVersion: _schemaVersion, ...rest } = legacy;
+  const {
+    workspace: _workspace,
+    vscode: _vscode,
+    schemaVersion: _schemaVersion,
+    ...rest
+  } = legacy;
+  const projects = legacy.projects && typeof legacy.projects === "object"
+    ? legacy.projects as Record<string, unknown>
+    : {};
   return hubConfigSchema.parse({
     ...rest,
-    schemaVersion: 3,
+    schemaVersion: 5,
     projects: {
-      sourceKinds: ["vscode", "appServer"],
-      cacheSeconds: 30,
-      pendingPromptMinutes: 30
+      cacheSeconds: projects.cacheSeconds ?? 30,
+      pendingPromptMinutes: projects.pendingPromptMinutes ?? 30
     }
   });
 }
 
 export class FileConfigStore {
   public readonly path: string;
-  private readonly legacyPath: string;
+  private readonly legacyPaths: readonly string[];
 
   public constructor(home: string) {
-    this.path = join(home, "config.v3.json");
-    this.legacyPath = join(home, "config.v2.json");
+    this.path = join(home, "config.v5.json");
+    this.legacyPaths = [
+      join(home, "config.v4.json"),
+      join(home, "config.v3.json"),
+      join(home, "config.v2.json")
+    ];
   }
 
   public async load(): Promise<HubConfig> {
@@ -44,11 +59,20 @@ export class FileConfigStore {
         throw error;
       }
     }
-    const legacyRaw = await readFile(this.legacyPath, "utf8");
-    const migrated = migrateLegacyConfig(JSON.parse(legacyRaw));
-    await this.save(migrated);
-    await rm(this.legacyPath, { force: true });
-    return migrated;
+    for (const legacyPath of this.legacyPaths) {
+      try {
+        const legacyRaw = await readFile(legacyPath, "utf8");
+        const migrated = migrateLegacyConfig(JSON.parse(legacyRaw));
+        await this.save(migrated);
+        await rm(legacyPath, { force: true });
+        return migrated;
+      } catch (error) {
+        if (!isNotFound(error)) {
+          throw error;
+        }
+      }
+    }
+    throw new Error("未找到 Lark Codex Hub 配置，请先执行 setup。");
   }
 
   public async save(config: HubConfig): Promise<void> {

@@ -15,6 +15,7 @@ export type CommandId =
   | "cancel"
   | "new"
   | "resume"
+  | "retry"
   | "steer"
   | "tools"
   | "send"
@@ -45,7 +46,7 @@ export interface ParsedCommand {
 export const commandDefinitions: readonly CommandDefinition[] = [
   { id: "help", aliases: ["/help", "/hub", "帮助"], usage: "/hub", description: "打开动态 Codex 控制中心", category: "会话与任务", menuEventKey: "hub_help" },
   { id: "status", aliases: ["/status"], usage: "/status", description: "查看会话、后端和运行状态", category: "会话与任务", menuEventKey: "hub_status" },
-  { id: "projects", aliases: ["/projects", "/workspace"], usage: "/projects [页码或关键词]", description: "浏览 Desktop 风格项目中心", category: "项目与会话", menuEventKey: "hub_workspace" },
+  { id: "projects", aliases: ["/projects", "/workspace"], usage: "/projects [页码或关键词]", description: "浏览 Codex CLI 项目中心", category: "项目与会话", menuEventKey: "hub_workspace" },
   { id: "project", aliases: ["/project"], usage: "/project <项目编号>", description: "选择项目", category: "项目与会话", hidden: true },
   { id: "sessions", aliases: ["/sessions"], usage: "/sessions [页码]", description: "浏览当前项目内的会话", category: "项目与会话", menuEventKey: "hub_sessions" },
   { id: "inspect", aliases: ["/inspect"], usage: "/inspect <会话 ID> [页码]", description: "只读查看指定会话", category: "项目与会话", hidden: true },
@@ -57,6 +58,7 @@ export const commandDefinitions: readonly CommandDefinition[] = [
   { id: "cancel", aliases: ["/cancel"], usage: "/cancel", description: "取消当前任务并清空排队消息", category: "会话与任务", menuEventKey: "hub_cancel" },
   { id: "new", aliases: ["/new"], usage: "/new", description: "在当前项目创建新会话", category: "项目与会话", menuEventKey: "hub_new" },
   { id: "resume", aliases: ["/resume"], usage: "/resume <会话 ID 或序号>", description: "绑定当前项目内的 Codex 会话", category: "项目与会话" },
+  { id: "retry", aliases: ["/retry"], usage: "/retry [任务编号]", description: "重新执行最近一次会话占用任务", category: "会话与任务", hidden: true },
   { id: "steer", aliases: ["/steer"], usage: "/steer <补充指令>", description: "向正在执行的任务追加指令", category: "会话与任务" },
   { id: "tools", aliases: ["/tools"], usage: "/tools", description: "查看飞书扩展工具", category: "飞书扩展" },
   { id: "send", aliases: ["/send"], usage: "/send <身份> <类型> <ID> <内容>", description: "以 bot 或 user 身份发送消息", category: "飞书扩展", delegated: true },

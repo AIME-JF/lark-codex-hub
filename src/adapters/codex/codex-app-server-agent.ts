@@ -17,6 +17,7 @@ import type { Logger } from "../../observability/logger.js";
 import { errorMessage } from "../../observability/logger.js";
 import type { CodingAgent } from "../../ports/coding-agent.js";
 import { AppServerRpcClient } from "./app-server-rpc-client.js";
+import { progressLabel, statusType, textInput } from "./codex-event-mapper.js";
 import {
   lastAgentMessage,
   record,
@@ -25,7 +26,6 @@ import {
   threadIdFrom,
   toThreadDetails,
   toThreadSummary,
-  type JsonRecord,
   type RpcInboundMessage,
   type StableThreadForkParams,
   type StableThreadResumeParams,
@@ -49,64 +49,6 @@ interface ActiveTurn {
 
 interface InitializeResult {
   userAgent?: string;
-}
-
-function textInput(text: string): JsonRecord {
-  return { type: "text", text, text_elements: [] };
-}
-
-function statusType(value: unknown): string | undefined {
-  return stringValue(record(value)?.status) ?? stringValue(value);
-}
-
-function compactDetail(value: unknown, limit = 120): string | undefined {
-  const text = stringValue(value)?.replace(/\s+/gu, " ").trim();
-  return text ? text.slice(0, limit) : undefined;
-}
-
-function fileChangeDetail(item: JsonRecord): string | undefined {
-  if (!Array.isArray(item.changes)) {
-    return undefined;
-  }
-  const paths = item.changes
-    .map((change) => compactDetail(record(change)?.path, 80))
-    .filter((path): path is string => Boolean(path));
-  if (!paths.length) {
-    return undefined;
-  }
-  return `${paths.slice(0, 3).join("、")}${paths.length > 3 ? ` 等 ${paths.length} 个文件` : ""}`;
-}
-
-function progressLabel(itemValue: unknown, completed = false): string {
-  const item = record(itemValue);
-  const type = stringValue(item?.type);
-  const status = stringValue(item?.status);
-  const failed = status === "failed" || status === "declined";
-  const phase = completed ? (failed ? "失败" : "完成") : "正在执行";
-  if (type === "commandExecution") {
-    const command = compactDetail(item?.command);
-    return `${phase === "正在执行" ? "正在运行命令" : `命令执行${phase}`}${command ? `：${command}` : ""}`;
-  }
-  if (type === "fileChange") {
-    const files = fileChangeDetail(item ?? {});
-    return `${completed ? `文件修改${phase}` : "正在修改文件"}${files ? `：${files}` : ""}`;
-  }
-  if (type === "mcpToolCall") {
-    const tool = [compactDetail(item?.server, 60), compactDetail(item?.tool, 60)]
-      .filter(Boolean)
-      .join("/");
-    return `${completed ? `工具调用${phase}` : "正在调用工具"}${tool ? `：${tool}` : ""}`;
-  }
-  if (type === "dynamicToolCall") {
-    const tool = [compactDetail(item?.namespace, 60), compactDetail(item?.tool, 60)]
-      .filter(Boolean)
-      .join("/");
-    return `${completed ? `工具调用${phase}` : "正在调用工具"}${tool ? `：${tool}` : ""}`;
-  }
-  if (type === "agentMessage") {
-    return "正在组织回复";
-  }
-  return "正在处理";
 }
 
 export class CodexAppServerAgent implements CodingAgent {
@@ -301,7 +243,7 @@ export class CodexAppServerAgent implements CodingAgent {
     }
     const occupiedBy = this.activeThreads.get(threadId);
     if (occupiedBy && occupiedBy !== request.scopeKey) {
-      throw new SessionBusyError();
+      throw new SessionBusyError("该会话已有 Hub 任务正在执行。", "hub");
     }
 
     let resolveCompletion!: (result: ExecutionResult) => void;
@@ -366,7 +308,7 @@ export class CodexAppServerAgent implements CodingAgent {
         clientInfo: {
           name: "lark_codex_hub",
           title: "Lark Codex Hub",
-          version: "1.3.0"
+          version: "1.5.0"
         },
         capabilities: {
           experimentalApi: false,
@@ -665,6 +607,11 @@ export class CodexAppServerAgent implements CodingAgent {
 
   private mapError(error: unknown): Error {
     const detail = errorMessage(error);
-    return isNativeSessionBusyMessage(detail) ? new SessionBusyError() : error instanceof Error ? error : new Error(detail);
+    return isNativeSessionBusyMessage(detail)
+      ? new SessionBusyError(
+          "目标会话正在被 Codex Desktop、VS Code 或另一个 Codex 入口使用。",
+          "desktop_or_external"
+        )
+      : error instanceof Error ? error : new Error(detail);
   }
 }

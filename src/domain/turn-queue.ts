@@ -14,6 +14,7 @@ export interface TurnCancelResult {
 
 export interface TurnControl {
   enqueue(message: InboundMessage, scopeKey: string, prompt: string): Promise<number>;
+  retry(scopeKey: string, id?: string): Promise<number>;
   cancel(scopeKey: string): Promise<TurnCancelResult>;
   steer(scopeKey: string, prompt: string, message?: InboundMessage): Promise<boolean>;
   shouldSteerReply(message: InboundMessage, scopeKey: string): boolean;

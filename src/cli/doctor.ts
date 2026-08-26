@@ -11,6 +11,7 @@ import { scheduledTaskStatus } from "../adapters/windows/scheduled-task.js";
 import { resolveCommand } from "../adapters/process/command-resolver.js";
 import { NodeWorkspaceResolver } from "../adapters/fs/node-workspace-resolver.js";
 import { CodexAppServerAgent } from "../adapters/codex/codex-app-server-agent.js";
+import { CodexProjectMetadataStore } from "../adapters/codex/codex-project-metadata.js";
 import { ProjectCatalogService } from "../application/project-catalog-service.js";
 import type { Logger } from "../observability/logger.js";
 
@@ -67,7 +68,7 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
   let config;
   try {
     config = await new FileConfigStore(home).load();
-    checks.push({ name: "配置", ok: true, detail: "config.v3.json 有效" });
+    checks.push({ name: "配置", ok: true, detail: "config.v5.json 有效" });
   } catch (error) {
     checks.push({ name: "配置", ok: false, detail: String(error) });
     return checks;
@@ -109,7 +110,7 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
       const catalog = await new ProjectCatalogService(
         agent,
         new NodeWorkspaceResolver(),
-        config.projects.sourceKinds,
+        new CodexProjectMetadataStore(),
         config.projects.cacheSeconds * 1_000
       ).snapshot(true);
       checks.push({
@@ -127,8 +128,6 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
       await commandOutput(config.codex.command, [
         "exec",
         "--json",
-        "--color",
-        "never",
         "-c",
         'approval_policy="never"',
         "--sandbox",

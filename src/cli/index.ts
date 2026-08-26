@@ -124,7 +124,7 @@ async function status(home: string): Promise<void> {
       {
         ownerOpenId: config.feishu.ownerOpenId,
         configVersion: config.schemaVersion,
-        projectSources: config.projects.sourceKinds,
+        codexBackend: config.codex.backend,
         scheduledTask: task,
         database: health
       },

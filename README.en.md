@@ -2,29 +2,29 @@
 
 [中文](README.md) · [Feishu setup](docs/FEISHU_SETUP.md) · [Operations](docs/OPERATIONS.md) · [Architecture](ARCHITECTURE.md)
 
-![version](https://img.shields.io/badge/version-1.3.0-3370ff)
+![version](https://img.shields.io/badge/version-1.5.0-3370ff)
 ![platform](https://img.shields.io/badge/platform-Windows-0078d4)
 ![node](https://img.shields.io/badge/Node.js-%3E%3D22.12-339933)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Turn your private Feishu/Lark bot into a secure, durable, and recoverable remote control plane for Codex App Server running on your own Windows computer.
 
-You can send coding tasks from Feishu, resume Codex sessions, switch approved workspaces, receive completion cards, and optionally invoke a small allowlist of `lark-cli` actions. Source code and credentials remain on your workstation; no public server or third-party relay is required.
+You can send coding tasks from Feishu, resume persistent Codex sessions, switch discovered projects, receive completion cards, and optionally invoke a small allowlist of `lark-cli` actions. Source code and credentials remain on your workstation; no public server or third-party relay is required.
 
 > [!IMPORTANT]
-> This is a self-hosted tool for a personal Windows workstation, not a multi-user hosted Codex service. The bot runs Codex locally and can modify files under configured roots. Review the [security boundaries](#security-boundaries) before installation.
+> This is a self-hosted tool for a personal Windows workstation, not a multi-user hosted Codex service. The bot runs Codex locally and can modify files in the selected project. Review the [security boundaries](#security-boundaries) before installation.
 
 ## Highlights
 
 - Create, resume, inspect, switch, and cancel Codex sessions from Feishu.
-- Discover and bind Desktop, VS Code, CLI, and Hub threads inside configured workspace roots.
-- Recycle the Hub App Server after the final active Feishu turn so another client can acquire the thread writer immediately.
+- Discover and bind persistent Codex threads created by Desktop, VS Code, CLI, or Hub.
+- Keep the official Desktop and VS Code launch paths untouched; clients hand off the same persisted thread sequentially.
 - Persist user turns in a FIFO queue, coalesce rapid messages, and stream output into one live card.
 - Persist inbound events, deliveries, sessions, leases, approvals, and recovery state in SQLite WAL.
 - Render Card 2.0 replies with Markdown continuation cards, timing, workspace, session, and token usage.
 - Show thinking, working, typing, completion, failure, and cancellation reactions on the original message.
 - Prevent concurrent writes to the same Codex session across Feishu scopes.
-- Restrict users, chats, sandbox modes, and real filesystem roots by default.
+- Restrict users, chats, sandbox modes, and unsafe filesystem roots by default.
 - Send proactive notifications from local scripts through a durable retry queue.
 - Optionally create Lark tasks/documents or send messages through validated `lark-cli` actions.
 - Start silently at Windows logon and stop gracefully for upgrades.
@@ -91,14 +91,12 @@ $env:LARK_APP_ID = "cli_xxx"
 $env:LARK_APP_SECRET = "your App Secret"
 
 node .\dist\cli\index.js setup --from-env `
-  --owner "ou_xxx" `
-  --workspace "D:\your-project" `
-  --allow-root "D:\allowed-root"
+  --owner "ou_xxx"
 
 Remove-Item Env:LARK_APP_ID, Env:LARK_APP_SECRET
 ```
 
-Credentials are encrypted with current-user Windows DPAPI. If `lark-cli` is not installed, set `larkCli.enabled` to `false` in `%USERPROFILE%\.lark-codex-hub\config.v2.json`.
+Credentials are encrypted with current-user Windows DPAPI. If `lark-cli` is not installed, set `larkCli.enabled` to `false` in `%USERPROFILE%\.lark-codex-hub\config.v5.json`.
 
 The recyclable App Server backend is the default. Hub keeps it only while needed and closes the child process after the final active Feishu turn to release cross-client writer ownership. Set `codex.backend` to `exec` only as an explicit compatibility fallback.
 
@@ -120,16 +118,16 @@ Send `/status` to the bot. A status card confirms the full message path is worki
 | Command | Purpose |
 | --- | --- |
 | `/help`, `/hub` | Open the context-aware Codex control center |
-| `/new` | Clear the current binding; the next message creates a session |
+| `/new` | Explicitly choose to create a session in the current project |
 | `/status` | Show workspace, session, and runtime state |
-| `/sessions [page]` | Page through global Desktop, VS Code, CLI, and Hub sessions inside allowed roots |
+| `/projects [page or query]` | Browse Codex projects grouped by working directory |
+| `/sessions [page]` | Page through global Codex sessions in the current project |
 | `/history [page]` | Page through user and assistant messages in the bound session |
 | `/resume <session_id>` | Bind an allowed global session without loading or locking it |
 | `/cancel` | Cancel the active task |
 | `/queue` | Show messages waiting for execution |
 | `/steer <instruction>` | Add an instruction to the active turn |
-| `/workspace` | Show the current workspace |
-| `/workspace <path>` | Switch to an allowed directory and start a new session |
+| `/workspace` | Alias for `/projects` |
 | `/tools` | Show optional Feishu/Lark extension commands |
 | `/send <bot\|user> <open_id\|chat_id> <ID> <text>` | Send a validated `lark-cli` message |
 | `/task <summary>` | Create a Lark task as the authorized user |
@@ -154,7 +152,7 @@ The default state directory is `%USERPROFILE%\.lark-codex-hub`:
 
 | Path | Purpose |
 | --- | --- |
-| `config.v2.json` | Non-secret policy and runtime configuration |
+| `config.v5.json` | Non-secret policy and runtime configuration |
 | `secrets.v2.json` | Current-user DPAPI-encrypted app credentials |
 | `hub.sqlite*` | Sessions, queues, leases, runs, and approvals |
 | `logs\hub.log*` | Rotating structured logs with redaction |
@@ -178,10 +176,11 @@ Read [Security Policy](SECURITY.md) for the full threat model and reporting guid
 ## Known limitations
 
 - The Codex App Server command and protocol can evolve with Codex CLI releases; run `doctor` after upgrading Codex CLI.
-- Hub uses the Codex App Server protocol, but it is still a separate client process. Feishu and Desktop or VS Code must not write the same session concurrently. Hub recycles its App Server after the final active Feishu turn to release writer ownership.
-- Cross-client sharing covers persisted history, not a shared live event stream. Refresh or reopen the thread in Desktop or VS Code after a Feishu turn when needed.
+- Desktop, VS Code, CLI, and Hub share persisted Codex history, not a real-time mirrored interface; thread lists may need a refresh.
+- A thread can have only one App Server writer at a time. When a local client owns it, Feishu reports the busy state and never silently creates a replacement thread.
+- Hub recycles its App Server after the final Feishu turn so another Codex client can resume the thread.
 - A forcibly interrupted Codex run is not automatically replayed because it may already have changed files.
-- The current bridge forwards text prompts only; Feishu image and file attachments are not passed to Codex.
+- Feishu image and file attachments are not currently passed to Codex.
 - Documentation for the Feishu console is Chinese-first because console labels differ by tenant and locale.
 
 ## Documentation

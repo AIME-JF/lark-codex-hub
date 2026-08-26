@@ -93,6 +93,21 @@ export class CommandRouter {
       return false;
     }
     const command = parsed.definition.id;
+    if (command === "retry") {
+      try {
+        const pending = await this.turns.retry(context.scopeKey, parsed.args.trim() || undefined);
+        await context.reply(`原消息已重新进入执行队列，当前等待 ${pending} 条。`, {
+          title: "已重新排队",
+          kind: "status",
+          tone: "success",
+          status: "等待执行",
+          actions: [registeredCommandAction("查看队列", "queue", "", "primary")]
+        });
+      } catch (error) {
+        await this.replyError(context, "无法重新执行", error);
+      }
+      return true;
+    }
     const args = parsed.args;
     const { scopeKey } = context;
 
@@ -250,8 +265,9 @@ export class CommandRouter {
       }
       const project = await this.sessions.selectedProject(scopeKey);
       const pending = this.store.consumePendingPrompt(scopeKey, Date.now());
-      if (!project || !pending) {
-        await context.reply("暂存消息已过期，或当前还没有选择项目。", {
+      const target = this.store.getConversation(scopeKey) ?? this.store.getNewSessionIntent(scopeKey);
+      if (!project || !pending || !target) {
+        await context.reply("暂存消息已过期，或当前还没有选择项目和会话。", {
           title: "暂存消息无法执行",
           tone: "warning",
           status: "已失效"
@@ -391,6 +407,8 @@ export class CommandRouter {
     if (command === "status") {
       const project = await this.sessions.selectedProject(scopeKey);
       const link = this.store.getConversation(scopeKey);
+      const newSessionIntent = this.store.getNewSessionIntent(scopeKey);
+      const targetReady = Boolean(link || newSessionIntent);
       const queue = this.turns.snapshot(scopeKey);
       const running = queue.active || this.agent.activeScopes().includes(scopeKey);
       const latestRun = this.store.getLatestRun(scopeKey);
@@ -400,6 +418,8 @@ export class CommandRouter {
       await context.reply(
         !project
           ? "当前尚未选择项目，普通消息不会执行。"
+          : !targetReady
+            ? "项目已经选择，但还需要选择历史会话或明确新建会话。"
           : running
             ? "Codex 正在处理当前会话中的任务。"
             : health.ready
@@ -408,12 +428,23 @@ export class CommandRouter {
         {
           title: "运行状态",
           kind: "status",
-          tone: !project || !health.ready ? "warning" : running ? "warning" : "success",
-          status: !project ? "未选择项目" : running ? "执行中" : health.ready ? "空闲" : "后端不可用",
+          tone: !project || !targetReady || !health.ready ? "warning" : running ? "warning" : "success",
+          status: !project
+            ? "未选择项目"
+            : !targetReady
+              ? "未选择会话"
+              : running
+                ? "执行中"
+                : health.ready
+                  ? "空闲"
+                  : "后端不可用",
           fields: [
             { label: "当前项目", value: project?.name ?? "未选择" },
             { label: "项目目录", value: project?.cwd ?? "—" },
-            { label: "Codex 会话", value: link?.sessionId ?? "尚未创建" },
+            {
+              label: "Codex 会话",
+              value: link?.sessionId ?? (newSessionIntent ? "等待新建" : "尚未选择")
+            },
             { label: "执行后端", value: health.backend },
             { label: "最近执行", value: runStateLabel(latestRun) },
             { label: "排队消息", value: String(queue.pending) },

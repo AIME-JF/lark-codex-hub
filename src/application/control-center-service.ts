@@ -27,12 +27,14 @@ export class ControlCenterService {
   public constructor(
     private readonly store: StateRepository,
     private readonly turns: TurnControl,
-    private readonly sessions: SessionCatalogService
+    private readonly sessions: SessionCatalogService,
+    private readonly codexEntryStatus: () => string = () => "Codex CLI / App Server"
   ) {}
 
   public async home(scopeKey: string): Promise<ControlCenterView> {
     const project = await this.sessions.selectedProject(scopeKey);
     const link = this.store.getConversation(scopeKey);
+    const newSessionIntent = this.store.getNewSessionIntent(scopeKey);
     const queue = this.turns.snapshot(scopeKey);
     const latestRun = this.store.getLatestRun(scopeKey);
     const pending = this.store.getPendingPrompt(scopeKey, Date.now());
@@ -67,7 +69,11 @@ export class ControlCenterService {
             ? pending
               ? "有一条消息正在等待选择项目和会话，普通消息暂时不会执行。"
               : "请先选择项目，然后选择已有会话或在项目中创建新会话。"
-            : "直接发送需求即可继续当前会话，也可以切换项目或会话。",
+            : link
+              ? "直接发送需求即可继续当前会话，也可以切换项目或会话。"
+              : newSessionIntent
+                ? "已经明确选择新建会话，下一条消息会创建新的 Codex 会话。"
+                : "项目已选择，请继续选择历史会话或明确新建会话。",
       options: {
         title: "Codex 控制中心",
         kind: "help",
@@ -83,10 +89,20 @@ export class ControlCenterService {
         fields: [
           { label: "当前项目", value: project?.name ?? "未选择" },
           { label: "项目目录", value: project?.cwd ?? "—" },
-          { label: "当前会话", value: link?.sessionId ? `${link.sessionId.slice(0, 8)}…` : project ? "下条消息新建" : "—" },
+          {
+            label: "当前会话",
+            value: link?.sessionId
+              ? `${link.sessionId.slice(0, 8)}…`
+              : newSessionIntent
+                ? "等待新建"
+                : project
+                  ? "尚未选择"
+                  : "—"
+          },
           { label: "暂存消息", value: pending ? "等待确认" : "无" },
           { label: "最近运行", value: runLabel(latestRun) },
-          { label: "排队消息", value: String(queue.pending) }
+          { label: "排队消息", value: String(queue.pending) },
+          { label: "执行入口", value: this.codexEntryStatus() }
         ],
         actions
       }

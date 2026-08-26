@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { FileConfigStore } from "../adapters/config/file-config.js";
 import { CodexExecAgent } from "../adapters/codex/codex-exec-agent.js";
 import { CodexAppServerAgent } from "../adapters/codex/codex-app-server-agent.js";
+import { CodexProjectMetadataStore } from "../adapters/codex/codex-project-metadata.js";
 import { FeishuMessenger } from "../adapters/feishu/feishu-messenger.js";
 import { LarkCliActionBroker } from "../adapters/lark-cli/lark-cli-action-broker.js";
 import { NodeWorkspaceResolver } from "../adapters/fs/node-workspace-resolver.js";
@@ -101,7 +102,7 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
   const projectCatalog = new ProjectCatalogService(
     agent,
     workspaces,
-    config.projects.sourceKinds,
+    new CodexProjectMetadataStore(),
     config.projects.cacheSeconds * 1_000
   );
   const sessions = new SessionCatalogService(
@@ -129,7 +130,11 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
     config.runtime.maxConcurrentTurns,
     logger
   );
-  const controlCenter = new ControlCenterService(store, turns, sessions);
+  const controlCenter = new ControlCenterService(
+    store,
+    turns,
+    sessions
+  );
   const controller = new HubController(
     config,
     agent,
@@ -184,7 +189,7 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
   inbound.start();
   logger.info("Lark Codex Hub 已启动", {
     owner: config.feishu.ownerOpenId,
-    projectSources: config.projects.sourceKinds
+    codexBackend: config.codex.backend
   });
 
   let closed = false;

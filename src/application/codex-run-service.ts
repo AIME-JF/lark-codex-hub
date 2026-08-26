@@ -9,6 +9,8 @@ import { errorMessage } from "../observability/logger.js";
 import type { CodingAgent } from "../ports/coding-agent.js";
 import type { StateRepository } from "../ports/state-repository.js";
 import type { WorkspaceResolver } from "../ports/workspace-resolver.js";
+import { SessionBusyError } from "../domain/execution-errors.js";
+import { registeredCommandAction } from "../domain/command-registry.js";
 import type { DeliveryWorker } from "./delivery-worker.js";
 import type { LiveCardService } from "./live-card-service.js";
 import { durationText, presentation } from "./presentation-factory.js";
@@ -70,7 +72,8 @@ export class CodexRunService {
     const now = Date.now();
     const leaseMs = this.config.runtime.leaseSeconds * 1_000;
     const link = this.store.getConversation(scopeKey);
-    const requestedCwd = this.store.getProject(scopeKey) ?? link?.cwd;
+    const newSessionIntent = this.store.getNewSessionIntent(scopeKey);
+    const requestedCwd = link?.cwd ?? newSessionIntent?.cwd ?? this.store.getProject(scopeKey);
     if (!requestedCwd) {
       const detail = "尚未选择项目，消息没有执行。";
       this.deliveries.enqueueReply(
@@ -81,6 +84,23 @@ export class CodexRunService {
           status: "未执行"
         }),
         { idempotencyKey: `${message.eventId}:missing-project` }
+      );
+      return { state: "failed", terminalDeliveryQueued: false, error: detail };
+    }
+    if (!link && !newSessionIntent) {
+      const detail = "已选择项目，但尚未选择继续已有会话还是新建会话。";
+      this.deliveries.enqueueReply(
+        message.messageId,
+        presentation("请选择一个历史会话，或者明确点击“新建会话”。本条消息没有执行。", {
+          title: "需要选择会话",
+          tone: "warning",
+          status: "未执行",
+          actions: [
+            registeredCommandAction("选择历史会话", "sessions", "", "primary"),
+            registeredCommandAction("新建会话", "new")
+          ]
+        }),
+        { idempotencyKey: `${message.eventId}:missing-session-target` }
       );
       return { state: "failed", terminalDeliveryQueued: false, error: detail };
     }
@@ -289,6 +309,52 @@ export class CodexRunService {
       const detail = errorMessage(error);
       this.store.finishRun(runId, "failed", Date.now(), detail);
       this.logger.error("Codex 任务失败", { runId, scopeKey, error: detail });
+      if (error instanceof SessionBusyError) {
+        const guidance = error.owner === "hub"
+            ? "Hub 内已有任务占用这个会话。请等待当前队列完成后重新执行。"
+            : "这个会话已被 Codex Desktop、VS Code 或另一个 Codex CLI 进程持有。请先让本地入口释放该会话，再点击“重新执行”。";
+        const busyCard = presentation(guidance, {
+          title: "会话正在其他入口使用",
+          kind: "answer",
+          tone: "warning",
+          status: "等待交接",
+          fields: [
+            { label: "工作目录", value: cwd },
+            { label: "会话", value: link?.sessionId ?? currentSessionId ?? "尚未创建" },
+            { label: "占用来源", value: error.owner === "hub" ? "Lark Codex Hub" : "Codex 本地入口" }
+          ],
+          actions: [
+            registeredCommandAction("重新执行", "retry", runId, "primary"),
+            registeredCommandAction("新建会话", "new"),
+            registeredCommandAction("查看状态", "status")
+          ]
+        });
+        try {
+          transcript.record("会话正在其他入口使用，等待交接");
+          const frozenCard = progressCard(transcript, "等待交接", cwd, true);
+          await this.liveCards?.finish(runId, frozenCard, (liveMessageId, card) => {
+            this.deliveries.enqueueUpdate(liveMessageId, card, {
+              idempotencyKey: `${message.eventId}:codex-process-busy`
+            });
+          });
+          this.deliveries.enqueueReply(message.messageId, busyCard, {
+            idempotencyKey: `${message.eventId}:session-busy`,
+            terminalReaction: "waiting",
+            reactionTargets
+          });
+          deliveryQueued = true;
+        } catch (deliveryError) {
+          this.logger.error("会话占用提示无法进入投递队列", {
+            runId,
+            error: errorMessage(deliveryError)
+          });
+        }
+        return {
+          state: "busy",
+          terminalDeliveryQueued: deliveryQueued,
+          error: `session_busy:${error.owner}:${detail}`
+        };
+      }
       const errorCard = presentation(`执行失败：${detail}`, {
         title: "Codex 执行失败",
         kind: "answer",

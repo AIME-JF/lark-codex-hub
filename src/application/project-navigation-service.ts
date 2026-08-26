@@ -53,7 +53,7 @@ export class ProjectNavigationService {
             .join("\n\n")
         : normalizedQuery
           ? `没有找到包含“${query.slice(0, 80)}”的项目。`
-          : "还没有从 Desktop、VS Code 或 Hub 发现项目。请先在 Desktop 或 VS Code 中打开项目并创建一次会话。",
+          : "还没有发现可用的 Codex CLI 项目会话。请先在任一 Codex 客户端中创建一次会话。",
       options: {
         title: migrationThreadId ? "选择迁入项目" : "Codex 项目中心",
         kind: "status",

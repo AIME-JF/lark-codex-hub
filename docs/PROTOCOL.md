@@ -13,13 +13,16 @@ scope_key = chat_id + ":" + sender_open_id
 每个范围拥有：
 
 - 一个当前 Codex session 绑定。
-- 一个工作目录偏好。
+- 一个项目工作目录偏好。
+- 一个可选的显式新建会话意图。
 - 多个历史 session 元数据。
 - 当前范围内的命令与动作上下文。
 
 同一飞书聊天中的不同发送者不会自动共享 Codex session。
 
-`/sessions` 的发现范围不是上述飞书私有历史。Hub 会分页调用 Codex `thread/list`，显式包含 `cli`、`vscode`、`exec` 和 `appServer`，再按 `allowedRoots` 验证真实工作目录。`/resume` 通过 `thread/read` 验证指定 ID 并更新绑定；只读操作不会加载线程或订阅事件。
+`/sessions` 的发现范围不是上述飞书私有历史。Hub 会分页调用 Codex `thread/list`，包含 `cli`、`vscode` 和 `appServer` 交互会话，再验证真实工作目录并排除危险目录。Desktop 本地项目名称仅作为相同 `cwd` 的显示别名。`/resume` 会绑定指定 ID；只读操作不会加载线程或订阅事件。
+
+选择项目只更新项目偏好并清除旧目标，不会隐式创建 thread。只有 `/resume` 成功绑定历史会话，或用户明确执行 `/new` 写入新建意图后，普通消息才能进入 Turn 队列。`thread/start` 只允许用于后一种情况。
 
 ## 入站事件
 
@@ -69,7 +72,9 @@ thread/unsubscribe -> recycle app-server when idle
 
 未知通知会忽略，以保持对后续 App Server 字段扩展的兼容性。意外审批或输入请求会被安全拒绝，避免无人值守服务永久等待。
 
-App Server 加载同一 thread 后会取得该 thread 的 writer。仅取消订阅不会立即卸载线程，因此最后一个飞书 Turn 结束后 Hub 会回收 App Server 子进程，确保 writer 可以立即交还给 Desktop 或 VS Code。读取、列表和 Turn 操作由引用计数保护，所有 RPC 结束后才允许回收；子进程代际编号会隔离旧实例的延迟退出事件。
+App Server 加载同一 thread 后会取得该 thread 的 writer。Hub 不修改 Desktop 或 VS Code 的启动入口，也不注入它们的 App Server；所有飞书 Turn 都使用 Hub 自己的可回收 App Server。其他 Codex 客户端已经持有 writer 时，冲突会转换为类型化忙碌状态和安全重试动作，不会改用 `thread/start` 创建替代会话。
+
+仅取消订阅不会立即卸载线程，因此最后一个飞书 Turn 结束后会回收 Hub 子进程并释放 writer。读取、列表和 Turn 操作由引用计数保护，所有 RPC 结束后才允许回收；子进程代际编号会隔离旧实例的延迟退出事件。
 
 ## Turn 队列
 

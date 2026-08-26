@@ -7,10 +7,11 @@ import type {
   UnclassifiedReason,
   UnclassifiedThread
 } from "../contracts/events.js";
+import type { CodexProjectMetadataStore } from "../adapters/codex/codex-project-metadata.js";
 import type { CodingAgent } from "../ports/coding-agent.js";
 import type { WorkspaceResolver } from "../ports/workspace-resolver.js";
 
-const ALL_SOURCES: readonly AgentThreadSource[] = ["cli", "vscode", "exec", "appServer"];
+const INTERACTIVE_SOURCES: readonly AgentThreadSource[] = ["cli", "vscode", "appServer"];
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
 
@@ -32,21 +33,13 @@ function projectKey(cwd: string): string {
   return createHash("sha256").update(pathIdentity(cwd)).digest("hex").slice(0, 16);
 }
 
-function unsupportedSourceDetail(source: AgentThreadSource): string {
-  return source === "cli"
-    ? "该会话来自 Codex CLI，默认不作为 Desktop 项目。"
-    : source === "exec"
-      ? "该会话来自旧版 Exec 后端。"
-      : "该会话来源无法识别。";
-}
-
 export class ProjectCatalogService {
   private cached: ProjectCatalogSnapshot | undefined;
 
   public constructor(
     private readonly agent: CodingAgent,
     private readonly workspaces: WorkspaceResolver,
-    private readonly projectSources: readonly AgentThreadSource[],
+    private readonly metadata: CodexProjectMetadataStore,
     private readonly cacheMs: number
   ) {}
 
@@ -65,7 +58,7 @@ export class ProjectCatalogService {
       const result = await this.agent.listThreads({
         limit: PAGE_SIZE,
         ...(cursor ? { cursor } : {}),
-        sourceKinds: ALL_SOURCES,
+        sourceKinds: INTERACTIVE_SOURCES,
         useStateDbOnly: false
       });
       for (const thread of result.threads) {
@@ -82,14 +75,12 @@ export class ProjectCatalogService {
 
     const projects = new Map<string, CodexProject>();
     const unclassified: UnclassifiedThread[] = [];
+    const metadata = await this.metadata.snapshot();
     for (const thread of threads) {
       const inspection = await this.workspaces.inspectProject(thread.cwd);
       let reason: UnclassifiedReason | undefined;
       let reasonDetail = "";
-      if (!this.projectSources.includes(thread.source)) {
-        reason = "unsupported_source";
-        reasonDetail = unsupportedSourceDetail(thread.source);
-      } else if (inspection.reason) {
+      if (inspection.reason) {
         reason = inspection.reason;
         reasonDetail = inspection.detail ?? "工作目录不能作为项目。";
       }
@@ -102,7 +93,13 @@ export class ProjectCatalogService {
         });
         continue;
       }
-      const key = projectKey(inspection.cwd);
+      const localProject = this.metadata.match(
+        metadata,
+        thread.id,
+        inspection.cwd,
+        thread.projectId
+      );
+      const key = localProject?.id ?? projectKey(inspection.cwd);
       const existing = projects.get(key);
       const normalizedThread = { ...thread, cwd: inspection.cwd };
       if (existing) {
@@ -112,8 +109,8 @@ export class ProjectCatalogService {
       } else {
         projects.set(key, {
           key,
-          name: basename(inspection.cwd) || inspection.cwd,
-          cwd: inspection.cwd,
+          name: localProject?.name ?? (basename(inspection.cwd) || inspection.cwd),
+          cwd: localProject?.rootPaths[0] ?? inspection.cwd,
           sessionCount: 1,
           updatedAt: thread.updatedAt,
           sessions: [normalizedThread]
@@ -142,7 +139,14 @@ export class ProjectCatalogService {
 
   public async projectByCwd(cwd: string): Promise<CodexProject | undefined> {
     const normalized = await this.workspaces.resolveProject(cwd).catch(() => undefined);
-    return normalized ? this.project(projectKey(normalized)) : undefined;
+    if (!normalized) {
+      return undefined;
+    }
+    const identity = pathIdentity(normalized);
+    return (await this.snapshot()).projects.find((project) =>
+      pathIdentity(project.cwd) === identity ||
+      project.sessions.some((thread) => pathIdentity(thread.cwd) === identity)
+    );
   }
 
   public async thread(threadId: string): Promise<AgentThreadSummary | undefined> {

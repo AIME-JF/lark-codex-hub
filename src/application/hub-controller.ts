@@ -44,7 +44,7 @@ export class HubController {
     private readonly deliveries: DeliveryWorker,
     private readonly turns: TurnControl,
     private readonly sessions: SessionCatalogService,
-    navigation: ProjectNavigationService,
+    private readonly navigation: ProjectNavigationService,
     controlCenter: ControlCenterService,
     logger: Logger
   ) {
@@ -146,6 +146,21 @@ export class HubController {
         expiresAt: message.receivedAt + this.pendingPromptTtlMs
       });
       await this.commands.handle(context, "/projects");
+      return;
+    }
+    if (
+      !this.store.getConversation(scopeKey) &&
+      !this.store.getNewSessionIntent(scopeKey)
+    ) {
+      this.store.savePendingPrompt({
+        scopeKey,
+        message,
+        prompt: text,
+        createdAt: message.receivedAt,
+        expiresAt: message.receivedAt + this.pendingPromptTtlMs
+      });
+      const view = await this.navigation.projectSessions(scopeKey, project.key);
+      await context.reply(view.content, view.options);
       return;
     }
     // 用户在已经选定项目后发送了新消息，视为主动放弃此前暂存内容。

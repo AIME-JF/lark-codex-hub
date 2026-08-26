@@ -17,6 +17,7 @@ import type {
 import type {
   ActiveReactionRecord,
   LiveCardRecord,
+  NewSessionIntentRecord,
   OutboxRecord,
   PendingActionRecord,
   PendingPromptRecord,
@@ -439,6 +440,9 @@ export class SqliteStateStore implements StateRepository {
         )
         .run(link);
       this.database
+        .prepare("DELETE FROM new_session_intents WHERE scope_key = ?")
+        .run(link.scopeKey);
+      this.database
         .prepare(
           `INSERT INTO session_history(scope_key, session_id, cwd, updated_at)
            VALUES(@scopeKey, @sessionId, @cwd, @updatedAt)
@@ -452,6 +456,29 @@ export class SqliteStateStore implements StateRepository {
 
   public clearConversation(scopeKey: string): void {
     this.database.prepare("DELETE FROM conversation_links WHERE scope_key = ?").run(scopeKey);
+  }
+
+  public getNewSessionIntent(scopeKey: string): NewSessionIntentRecord | undefined {
+    const row = this.database
+      .prepare("SELECT scope_key, cwd, updated_at FROM new_session_intents WHERE scope_key = ?")
+      .get(scopeKey) as { scope_key: string; cwd: string; updated_at: number } | undefined;
+    return row
+      ? { scopeKey: row.scope_key, cwd: row.cwd, updatedAt: row.updated_at }
+      : undefined;
+  }
+
+  public setNewSessionIntent(record: NewSessionIntentRecord): void {
+    this.database
+      .prepare(
+        `INSERT INTO new_session_intents(scope_key, cwd, updated_at) VALUES(?, ?, ?)
+         ON CONFLICT(scope_key) DO UPDATE SET
+           cwd = excluded.cwd, updated_at = excluded.updated_at`
+      )
+      .run(record.scopeKey, record.cwd, record.updatedAt);
+  }
+
+  public clearNewSessionIntent(scopeKey: string): void {
+    this.database.prepare("DELETE FROM new_session_intents WHERE scope_key = ?").run(scopeKey);
   }
 
   public getProject(scopeKey: string): string | undefined {
@@ -471,7 +498,10 @@ export class SqliteStateStore implements StateRepository {
   }
 
   public clearProject(scopeKey: string): void {
-    this.database.prepare("DELETE FROM project_preferences WHERE scope_key = ?").run(scopeKey);
+    this.database.transaction(() => {
+      this.database.prepare("DELETE FROM project_preferences WHERE scope_key = ?").run(scopeKey);
+      this.clearNewSessionIntent(scopeKey);
+    })();
   }
 
   public getWorkspace(scopeKey: string): string | undefined {
@@ -667,6 +697,21 @@ export class SqliteStateStore implements StateRepository {
         record.createdAt
       );
     return result.changes === 1;
+  }
+
+  public getRetryableTurn(scopeKey: string, id?: string): TurnJobRecord | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+                status, created_at
+         FROM turn_jobs
+         WHERE scope_key = ? AND status = 'failed'
+           AND last_error LIKE 'session_busy:%'
+           AND (? IS NULL OR id = ?)
+         ORDER BY updated_at DESC, rowid DESC LIMIT 1`
+      )
+      .get(scopeKey, id ?? null, id ?? null) as TurnJobRow | undefined;
+    return row ? turnJob(row) : undefined;
   }
 
   public listReadyTurnLanes(before: number, limit: number): TurnLaneRecord[] {

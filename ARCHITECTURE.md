@@ -81,9 +81,9 @@ src/
 
 ## Codex App Server 与会话并发
 
-飞书范围由 `chat_id + operator_open_id` 组成，拥有当前 Codex 绑定、工作目录偏好和 session 历史。全局会话目录以 Codex `thread/list` 为事实来源，显式查询 `cli`、`vscode`、`exec` 和 `appServer`，再通过真实路径解析过滤到 `allowedRoots`。Hub SQLite 只保存绑定和曾使用历史，不再承担全局会话发现。
+飞书范围由 `chat_id + operator_open_id` 组成，拥有当前 Codex 绑定、项目偏好、显式新建意图和 session 历史。全局会话目录以 Codex `thread/list` 为事实来源，查询 `cli`、`vscode` 和 `appServer` 交互会话，再通过真实路径解析排除危险目录。Desktop 的本地项目元数据只用于补充友好名称，不参与 thread 执行与绑定判定。Hub SQLite 只保存选择状态和曾使用历史，不承担全局会话发现。
 
-运行时按需启动一个 `codex app-server --listen stdio://`。Hub 通过省略 `jsonrpc` 字段的 JSONL RPC 与它通信。全局并发由 `runtime.maxConcurrentTurns` 限制，个人工作站默认值为 1：
+运行时只有一个 Codex 执行入口：Hub 按需启动 `codex app-server --listen stdio://`，通过省略 `jsonrpc` 字段的 JSONL RPC 通信。全局并发由 `runtime.maxConcurrentTurns` 限制，个人工作站默认值为 1：
 
 ```text
 initialize -> initialized
@@ -101,9 +101,9 @@ pending -> running -> completed | failed | cancelled | interrupted
 
 同一会话使用 FIFO 顺序执行。800 毫秒内的连续消息合并为一个 Turn；任务运行时，`/steer` 或回复当前任务消息会调用 `turn/steer`。`/cancel` 调用 `turn/interrupt` 并清除尚未运行的当前范围消息。
 
-有 session 绑定时，队列 lane 和租约资源键都是 `session:<id>`；没有绑定时是 `scope:<key>`。这样即使两个飞书范围指向同一 session，也只有一个任务能进入 Codex。另一个独立客户端造成的 `already has an active writer` 会转换为可理解的交接提示。
+有 session 绑定时，队列 lane 和租约资源键都是 `session:<id>`；明确选择新建时使用 `scope:<key>`。这样即使两个飞书范围指向同一 session，也只有一个任务能进入 Codex。单独选择项目不构成可执行目标；只有绑定历史 session 或持久化显式新建意图后，普通消息才允许入队。Desktop、VS Code 或其他 CLI 造成的 `already has an active writer` 会转换为带安全重试按钮的交接提示。
 
-`thread/read` 和 `thread/list` 不会加载会话，因此 `/sessions` 与 `/resume` 的绑定步骤不占用 writer。Codex App Server 即使取消订阅也会把已加载线程保留一段时间；为让 Desktop 或 VS Code 在飞书 Turn 完成后立即接管，最后一个活动 Turn 结束、失败或取消后，Hub 会回收 App Server 子进程。Hub 主服务、飞书连接和持久队列不会停止，下一次执行会自动重新初始化 App Server。
+`thread/read` 和 `thread/list` 不会加载会话，因此 `/sessions` 与 `/resume` 的绑定步骤不占用 writer。Hub App Server 即使取消订阅也会把已加载线程保留一段时间，因此最后一个飞书 Turn 结束、失败或取消后会回收子进程。这样可尽快把 thread writer 交还给 Desktop、VS Code 或其他 CLI，而 Hub 主服务、飞书连接和持久队列不会停止。
 
 每个 App Server 子进程具有独立代际编号，旧进程的延迟 `close/error` 不能清理新实例。Turn 使用单次结算标记合并完成、超时、取消、关闭和断连路径；只读 RPC 和执行操作使用引用计数，回收只会发生在所有操作完成之后。
 

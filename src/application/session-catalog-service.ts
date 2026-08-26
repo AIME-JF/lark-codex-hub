@@ -58,6 +58,7 @@ export class SessionCatalogService {
         return project;
       }
       this.store.clearProject(scopeKey);
+      this.store.clearNewSessionIntent(scopeKey);
     }
     const link = this.store.getConversation(scopeKey);
     if (!link) {
@@ -79,6 +80,7 @@ export class SessionCatalogService {
     }
     this.store.setProject(scopeKey, project.cwd, Date.now());
     this.store.clearConversation(scopeKey);
+    this.store.clearNewSessionIntent(scopeKey);
     return project;
   }
 
@@ -120,7 +122,7 @@ export class SessionCatalogService {
     const link: ConversationLink = {
       scopeKey,
       sessionId: selected.id,
-      cwd: project.cwd,
+      cwd: selected.cwd,
       updatedAt: Date.now()
     };
     this.store.bindConversation(link);
@@ -137,6 +139,11 @@ export class SessionCatalogService {
     }
     this.store.setProject(scopeKey, project.cwd, Date.now());
     this.store.clearConversation(scopeKey);
+    this.store.setNewSessionIntent({
+      scopeKey,
+      cwd: project.cwd,
+      updatedAt: Date.now()
+    });
     return project;
   }
 

@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 
-export const LATEST_SCHEMA_VERSION = 6;
+export const LATEST_SCHEMA_VERSION = 7;
 
 const latestSchema = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS workspace_preferences (
 );
 
 CREATE TABLE IF NOT EXISTS project_preferences (
+  scope_key TEXT PRIMARY KEY,
+  cwd TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS new_session_intents (
   scope_key TEXT PRIMARY KEY,
   cwd TEXT NOT NULL,
   updated_at INTEGER NOT NULL
@@ -324,6 +330,13 @@ function migrateToVersion6(database: Database.Database): void {
     .run(Date.now());
 }
 
+function migrateToVersion7(database: Database.Database): void {
+  database.exec(latestSchema);
+  database
+    .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(7, ?)")
+    .run(Date.now());
+}
+
 function migrateLegacyProjectPreferences(database: Database.Database): void {
   const legacy = database
     .prepare("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = 'workspace_preferences'")
@@ -377,6 +390,10 @@ export function migrateDatabase(database: Database.Database): void {
     }
     if (version < 6) {
       migrateToVersion6(database);
+      version = currentVersion(database);
+    }
+    if (version < 7) {
+      migrateToVersion7(database);
     }
     database.exec(latestSchema);
     migrateLegacyProjectPreferences(database);

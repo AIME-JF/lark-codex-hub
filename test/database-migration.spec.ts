@@ -54,7 +54,7 @@ describe("SQLite 数据库迁移", () => {
 
     expect(
       database.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()
-    ).toEqual({ version: 7 });
+    ).toEqual({ version: 9 });
     expect(database.prepare("SELECT state FROM runs WHERE id = 'run-1'").get()).toEqual({
       state: "completed"
     });

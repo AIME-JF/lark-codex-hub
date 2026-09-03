@@ -147,13 +147,15 @@ export class DeliveryWorker {
         } else {
           await this.messenger.updateCard(item.target.messageId, item.card);
         }
-        this.store.completeDelivery(item.id, this.holder, Date.now());
-        await this.finishReaction(
-          item.target,
-          item.trackerId,
-          item.terminalReaction,
-          item.reactionTargets
-        );
+        const sent = this.store.completeDelivery(item.id, this.holder, Date.now());
+        if (sent) {
+          await this.finishReaction(
+            item.target,
+            item.trackerId,
+            item.terminalReaction,
+            item.reactionTargets
+          );
+        }
       } catch (error) {
         const detail = errorMessage(error);
         if (item.attempts >= this.maxAttempts) {

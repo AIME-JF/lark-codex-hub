@@ -2,6 +2,24 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [1.6.0] - 2026-09-04
+
+### Added
+
+- Durable external-writer conflict cards with explicit A (wait), B (new blank session in the same project), and cancel choices.
+- Immutable turn targets, atomic one-time conflict callbacks, and restart recovery for waiting/branching conflict decisions; interrupted retry children are marked failed safely and can be retried manually.
+- Messages received while a conflict card is open are durably deferred; the A/B decision transfers the whole batch atomically, and late B-branch messages continue the session that was actually created.
+- Lifecycle notifications for silent Windows startup, shutdown, and unexpected service exits.
+- Reused A/B conflicts now update the acted-on card in place, persist its card message ID, and keep transient choice failures recoverable instead of flooding the chat with duplicate cards.
+
+### Changed
+
+- Conflict retries preserve the original project, session, message batch, and attempt identity; switching projects or sessions is blocked until the conflict is resolved.
+- The Exec compatibility backend no longer passes the unsupported `--color` option to current Codex CLI parsers.
+- Status and control-center cards degrade to persisted project data when live Codex catalog/health probes are temporarily unavailable.
+- Delivery leases now reject stale update-card revisions after restart, with a migration repair for legacy outbox rows that lacked revision metadata.
+- Configuration, client metadata, documentation, and release badges are aligned to version 1.6.0.
+
 ## [1.5.0] - 2026-08-26
 
 ### Added
@@ -116,3 +134,4 @@ All notable changes are documented here. This project follows Semantic Versionin
 [1.2.0]: https://github.com/AIME-JF/lark-codex-hub/compare/v1.1.0...v1.2.0
 [1.3.0]: https://github.com/AIME-JF/lark-codex-hub/compare/v1.2.0...v1.3.0
 [1.4.0]: https://github.com/AIME-JF/lark-codex-hub/compare/v1.3.0...HEAD
+[1.6.0]: https://github.com/AIME-JF/lark-codex-hub/compare/v1.5.0...v1.6.0

@@ -5,7 +5,7 @@ import { z } from "zod";
 const sandboxSchema = z.enum(["read-only", "workspace-write"]);
 
 export const hubConfigSchema = z.object({
-  schemaVersion: z.literal(5),
+  schemaVersion: z.literal(6),
   feishu: z.object({
     domain: z.enum(["feishu", "lark"]).default("feishu"),
     ownerOpenId: z.string().min(1),
@@ -30,7 +30,13 @@ export const hubConfigSchema = z.object({
   }),
   notifications: z.object({
     enabled: z.boolean().default(true),
-    maxAttempts: z.number().int().min(1).max(20).default(6)
+    maxAttempts: z.number().int().min(1).max(20).default(6),
+    lifecycle: z
+      .object({
+        mode: z.enum(["off", "minimal", "smart", "all"]).default("all"),
+        heartbeatSeconds: z.number().int().min(10).max(300).default(30)
+      })
+      .default({ mode: "all", heartbeatSeconds: 30 })
   }),
   presentation: z
     .object({
@@ -67,7 +73,7 @@ export function createDefaultConfig(
   _legacyWorkspaceRoot?: string
 ): HubConfig {
   return hubConfigSchema.parse({
-    schemaVersion: 5,
+    schemaVersion: 6,
     feishu: {
       domain: "feishu",
       ownerOpenId,
@@ -91,7 +97,11 @@ export function createDefaultConfig(
     },
     notifications: {
       enabled: true,
-      maxAttempts: 6
+      maxAttempts: 6,
+      lifecycle: {
+        mode: "all",
+        heartbeatSeconds: 30
+      }
     },
     presentation: {
       cardsEnabled: true,

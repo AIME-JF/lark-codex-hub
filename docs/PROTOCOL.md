@@ -22,7 +22,7 @@ scope_key = chat_id + ":" + sender_open_id
 
 `/sessions` 的发现范围不是上述飞书私有历史。Hub 会分页调用 Codex `thread/list`，包含 `cli`、`vscode` 和 `appServer` 交互会话，再验证真实工作目录并排除危险目录。Desktop 本地项目名称仅作为相同 `cwd` 的显示别名。`/resume` 会绑定指定 ID；只读操作不会加载线程或订阅事件。
 
-选择项目只更新项目偏好并清除旧目标，不会隐式创建 thread。只有 `/resume` 成功绑定历史会话，或用户明确执行 `/new` 写入新建意图后，普通消息才能进入 Turn 队列。`thread/start` 只允许用于后一种情况。
+选择项目只更新项目偏好并清除旧目标，不会隐式创建 thread。只有 `/resume` 成功绑定历史会话、用户明确执行 `/new` 写入新建意图，或用户在会话占用卡片选择 B 分支后，普通消息才能进入 Turn 队列。`thread/start` 仅用于这些明确的新会话意图。
 
 ## 入站事件
 
@@ -72,13 +72,15 @@ thread/unsubscribe -> recycle app-server when idle
 
 未知通知会忽略，以保持对后续 App Server 字段扩展的兼容性。意外审批或输入请求会被安全拒绝，避免无人值守服务永久等待。
 
-App Server 加载同一 thread 后会取得该 thread 的 writer。Hub 不修改 Desktop 或 VS Code 的启动入口，也不注入它们的 App Server；所有飞书 Turn 都使用 Hub 自己的可回收 App Server。其他 Codex 客户端已经持有 writer 时，冲突会转换为类型化忙碌状态和安全重试动作，不会改用 `thread/start` 创建替代会话。
+App Server 加载同一 thread 后会取得该 thread 的 writer。Hub 不修改 Desktop 或 VS Code 的启动入口，也不注入它们的 App Server；所有飞书 Turn 都使用 Hub 自己的可回收 App Server。其他 Codex 客户端已经持有 writer 时，冲突会转换为持久化的 A/B 选择：A 冻结原 thread 并等待释放后重试，B 使用 `thread/start` 在同一工作目录创建空白独立会话并执行原始消息。
+
+冲突卡片包含一次性 token、批次任务 ID、目标 session ID 和工作目录。回调必须通过原子状态检查；过期或重复卡片不会改变当前绑定。Hub 不删除外部锁文件，也不强制结束 Desktop/VS Code 进程。
 
 仅取消订阅不会立即卸载线程，因此最后一个飞书 Turn 结束后会回收 Hub 子进程并释放 writer。读取、列表和 Turn 操作由引用计数保护，所有 RPC 结束后才允许回收；子进程代际编号会隔离旧实例的延迟退出事件。
 
 ## Turn 队列
 
-普通消息在入站事件处理完成前写入 `turn_jobs`。同一 lane 按 FIFO 领取，lane 优先使用 `session:<thread-id>`，尚未创建会话时使用 `scope:<scope-key>`。
+普通消息在入站事件处理完成前写入 `turn_jobs`。同一 lane 按 FIFO 领取，lane 优先使用 `session:<thread-id>`，尚未创建会话时使用 `scope:<scope-key>`。每个任务同时保存不可变的 `target` 快照；重试不会因为当前会话绑定变化而改投目标。
 
 ```text
 pending -> running -> completed | failed | cancelled | interrupted
@@ -90,6 +92,7 @@ pending -> running -> completed | failed | cancelled | interrupted
 - `/steer` 和回复当前任务消息使用 `turn/steer`，不会创建第二个并发 Turn。
 - `/cancel` 使用 `turn/interrupt`，并把当前范围剩余 `pending` 消息标记为 `cancelled`。
 - 全局同时运行的 lane 数由 `runtime.maxConcurrentTurns` 控制，默认值为 1。
+- 外部 writer 冲突会创建 `session_conflicts` 记录；A 的等待重试和 B 的独立会话都按整个合并批次迁移，避免只重跑首条消息。
 
 ## 结构化飞书动作
 

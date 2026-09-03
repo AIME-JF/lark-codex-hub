@@ -7,6 +7,7 @@ import type {
   PresentationCard,
   TerminalReaction
 } from "./presentation.js";
+import type { TurnTarget } from "./session-routing.js";
 
 export type InboundJobPayload =
   | { kind: "message"; value: InboundMessage }
@@ -65,6 +66,12 @@ export interface TurnJobRecord {
   eventId: string;
   scopeKey: string;
   laneKey: string;
+  /**
+   * Target snapshot captured at enqueue time. Older database rows may not
+   * have this field; callers should provide a compatibility fallback when it
+   * is absent.
+   */
+  target?: TurnTarget;
   message: InboundMessage;
   prompt: string;
   state: TurnJobState;

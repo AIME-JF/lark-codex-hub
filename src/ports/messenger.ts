@@ -7,12 +7,14 @@ import type {
   PresentationCard,
   ReactionEmoji
 } from "../contracts/presentation.js";
+import type { ConnectionLifecycleEvent } from "../contracts/lifecycle.js";
 
 export interface Messenger {
   connect(
     messageHandler: (message: InboundMessage) => Promise<void>,
     cardActionHandler?: (action: InboundCardAction) => Promise<void>,
-    botMenuHandler?: (action: InboundBotMenuAction) => Promise<void>
+    botMenuHandler?: (action: InboundBotMenuAction) => Promise<void>,
+    lifecycleHandler?: (event: ConnectionLifecycleEvent) => Promise<void>
   ): Promise<void>;
   close(): Promise<void>;
   replyCard(

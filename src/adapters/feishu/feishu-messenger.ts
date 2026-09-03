@@ -10,6 +10,7 @@ import type {
   ReactionEmoji
 } from "../../contracts/presentation.js";
 import type { Messenger } from "../../ports/messenger.js";
+import type { ConnectionLifecycleEvent } from "../../contracts/lifecycle.js";
 import type { Logger } from "../../observability/logger.js";
 import { errorMessage } from "../../observability/logger.js";
 import { renderCardParts } from "./card-renderer.js";
@@ -131,6 +132,8 @@ export class FeishuMessenger implements Messenger {
   private messageHandler: ((message: InboundMessage) => Promise<void>) | undefined;
   private cardActionHandler: ((action: InboundCardAction) => Promise<void>) | undefined;
   private botMenuHandler: ((action: InboundBotMenuAction) => Promise<void>) | undefined;
+  private lifecycleHandler: ((event: ConnectionLifecycleEvent) => Promise<void>) | undefined;
+  private reconnectingAt: number | undefined;
 
   public constructor(
     private readonly appId: string,
@@ -162,11 +165,13 @@ export class FeishuMessenger implements Messenger {
   public async connect(
     messageHandler: (message: InboundMessage) => Promise<void>,
     cardActionHandler?: (action: InboundCardAction) => Promise<void>,
-    botMenuHandler?: (action: InboundBotMenuAction) => Promise<void>
+    botMenuHandler?: (action: InboundBotMenuAction) => Promise<void>,
+    lifecycleHandler?: (event: ConnectionLifecycleEvent) => Promise<void>
   ): Promise<void> {
     this.messageHandler = messageHandler;
     this.cardActionHandler = cardActionHandler;
     this.botMenuHandler = botMenuHandler;
+    this.lifecycleHandler = lifecycleHandler;
 
     const botResponse = await this.client.request({
       url: "/open-apis/bot/v3/info",
@@ -287,8 +292,31 @@ export class FeishuMessenger implements Messenger {
             this.logger.error("飞书通道错误", { error: error.message });
           }
         },
-        onReconnecting: () => this.logger.warn("飞书长连接正在重连"),
-        onReconnected: () => this.logger.info("飞书长连接已恢复")
+        onReconnecting: () => {
+          this.reconnectingAt ??= Date.now();
+          this.logger.warn("飞书长连接正在重连");
+          void this.lifecycleHandler?.({
+            type: "reconnecting",
+            at: this.reconnectingAt
+          })?.catch((error: unknown) => {
+            this.logger.warn("飞书重连状态回调失败", { error: errorMessage(error) });
+          });
+        },
+        onReconnected: () => {
+          const at = Date.now();
+          const disconnectedAt = this.reconnectingAt;
+          this.reconnectingAt = undefined;
+          this.logger.info("飞书长连接已恢复");
+          void this.lifecycleHandler?.({
+            type: "reconnected",
+            at,
+            ...(disconnectedAt
+              ? { disconnectedAt, durationMs: at - disconnectedAt }
+              : {})
+          })?.catch((error: unknown) => {
+            this.logger.warn("飞书恢复状态回调失败", { error: errorMessage(error) });
+          });
+        }
       });
       void this.wsClient.start({ eventDispatcher: dispatcher }).catch((error: unknown) => {
         if (!settled) {
@@ -309,6 +337,8 @@ export class FeishuMessenger implements Messenger {
     this.messageHandler = undefined;
     this.cardActionHandler = undefined;
     this.botMenuHandler = undefined;
+    this.lifecycleHandler = undefined;
+    this.reconnectingAt = undefined;
   }
 
   private async replyText(
@@ -443,7 +473,7 @@ export class FeishuMessenger implements Messenger {
   public async sendCard(
     target: { type: "open_id" | "chat_id"; id: string },
     presentation: PresentationCard,
-    idempotencyKey = randomUUID()
+    idempotencyKey: string = randomUUID()
   ): Promise<string | undefined> {
     let firstMessageId: string | undefined;
     for (const [index, part] of renderCardParts(presentation).entries()) {

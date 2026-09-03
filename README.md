@@ -2,7 +2,7 @@
 
 [English](README.en.md) · [飞书配置](docs/FEISHU_SETUP.md) · [运维手册](docs/OPERATIONS.md) · [架构说明](ARCHITECTURE.md)
 
-![version](https://img.shields.io/badge/version-1.5.0-3370ff)
+![version](https://img.shields.io/badge/version-1.6.0-3370ff)
 ![platform](https://img.shields.io/badge/platform-Windows-0078d4)
 ![node](https://img.shields.io/badge/Node.js-%3E%3D22.12-339933)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -31,7 +31,7 @@
 | 能力 | 基础安装 | 说明 |
 | --- | :---: | --- |
 | 飞书远程调用 Codex App Server | ✅ | 全局会话发现、新建、续接、恢复、转向和取消会话 |
-| Codex CLI 全局会话接续 | ✅ | Desktop、VS Code、CLI 与飞书共享持久化会话；占用时安全交接 |
+| Codex CLI 全局会话接续 | ✅ | Desktop、VS Code、CLI 与飞书共享持久化会话；占用时可选择等待原会话或新建独立会话 |
 | 流式 Card 2.0 回复 | ✅ | 单卡增量更新、Markdown、长内容分片、状态和 Token 信息 |
 | 进度与终态表情 | 可选 | 需要消息表情权限 |
 | 持久化与断电恢复 | ✅ | SQLite WAL、入站队列、Turn 队列、投递队列和幂等键 |
@@ -121,7 +121,7 @@ node .\dist\cli\index.js setup --from-env `
 Remove-Item Env:LARK_APP_ID, Env:LARK_APP_SECRET
 ```
 
-如果不使用 `lark-cli` 扩展，请打开 `%USERPROFILE%\.lark-codex-hub\config.v5.json`，将其关闭：
+如果不使用 `lark-cli` 扩展，请打开 `%USERPROFILE%\.lark-codex-hub\config.v6.json`，将其关闭：
 
 ```json
 {
@@ -174,7 +174,7 @@ node .\dist\cli\index.js service status
 | 命令 | 用途 |
 | --- | --- |
 | `/help`、`/hub` | 打开动态 Codex 控制中心 |
-| `/new` | 明确选择在当前项目创建新 Codex 会话 |
+| `/new`、`新建会话`、`开始新会话`、`新对话` | 明确选择在当前项目创建新 Codex 会话 |
 | `/status` | 查看工作目录、session 和运行状态 |
 | `/projects [页码或关键词]` | 浏览按工作目录归组的 Codex CLI 项目 |
 | `/sessions [页码]` | 分页查看当前项目内的全局 Codex 会话 |
@@ -192,6 +192,17 @@ node .\dist\cli\index.js service status
 
 除命令外的普通文本会发送给当前 Codex 会话；未知的 `/xxx` 命令会直接提示，不会消耗一次 Codex Turn。
 
+### 会话被 Desktop/VS Code 占用时
+
+如果目标会话正在被其他 Codex 入口使用，机器人会发送选择卡片：
+
+- **A 等待释放后继续（推荐）**：冻结原会话 ID、工作目录和原始消息，等待本地入口释放 writer 后自动重试；锁仍在时会更新同一张占用卡，不会反复刷屏。
+- **B 新建独立会话**：在同一项目目录创建空白新会话，并自动执行原始消息；不会继承旧会话上下文。
+- **取消本次请求**：取消这批消息，原会话绑定保持不变。
+
+每次待处理的选择只能被领取一次，过期或已结束的卡片会被拒绝；锁仍在时原卡会回到 A/B 选择，等待中的状态卡仍可用“取消等待”或 `/cancel` 收尾。Hub 不会删除锁文件、结束 Desktop/VS Code 进程或强行接管会话。
+占用卡片打开期间到达的普通消息会先进入持久化队列，处理 A/B 后与原批次一起执行；选择 B 后，后续消息会继续 B 实际创建的同一新会话。
+
 ## 主动通知
 
 其他本地脚本可以把完成结果写入可靠投递队列：
@@ -208,7 +219,7 @@ node .\dist\cli\index.js notify "构建已经完成"
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.v5.json` | 非敏感运行配置、用户和项目发现策略 |
+| `config.v6.json` | 非敏感运行配置、用户和项目发现策略 |
 | `secrets.v2.json` | 当前 Windows 用户 DPAPI 加密的 App 凭据 |
 | `hub.sqlite*` | session、队列、租约、运行和确认状态 |
 | `logs\hub.log*` | 自动轮转并脱敏的结构化日志 |
@@ -233,10 +244,11 @@ node .\dist\cli\index.js notify "构建已经完成"
 
 - Codex App Server 命令和协议仍可能随 Codex CLI 版本演进；升级 Codex CLI 后应先运行 `doctor` 再重启服务。
 - Desktop、VS Code、CLI 和飞书共享的是 Codex 持久化历史，不是界面的实时消息镜像；本地列表偶尔需要刷新。
-- 同一个 thread 同一时间只能由一个 App Server writer 持有。Desktop、VS Code 或其他 CLI 已加载会话时，飞书会提示占用，绝不会自动创建替代会话。
+- 同一个 thread 同一时间只能由一个 App Server writer 持有。Desktop、VS Code 或其他 CLI 已加载会话时，飞书会显示 A/B 选择卡片；A 等待原会话，B 创建同项目独立会话。
+- B 是空白独立会话，不继承旧上下文；两个会话仍可能同时修改同一工作目录中的文件，请避免并发编辑同一文件。
 - Hub 的飞书 Turn 结束后会回收自己的 App Server，尽快释放 writer 给其他 Codex 客户端。
 - 服务停止期间收到的飞书事件取决于飞书事件投递策略，项目只能恢复已经落入本地 SQLite 的事件。
-- 被强制终止的 Codex 任务不会自动重跑，因为它可能已经修改过文件；重启后机器人会提示人工检查。
+- 被强制终止的 Codex 任务不会自动重跑，因为它可能已经修改过文件；重启后机器人会提示人工检查。会话占用分支/重试若在崩溃点未完成，也会安全标记为失败，确认文件状态后用 `/retry` 手动继续。
 - 当前只支持文本提示，不支持从飞书消息直接传递图片或附件给 Codex。
 
 ## 排查问题
@@ -255,7 +267,7 @@ Get-Content "$env:USERPROFILE\.lark-codex-hub\logs\hub.log" -Tail 50
 | 菜单没有反应 | 菜单事件键是否使用 `hub_*`，是否订阅 `application.bot.menu_v6` |
 | 卡片按钮无效 | 是否订阅 `card.action.trigger`，修改后是否重新发布版本 |
 | 没有进度表情 | 是否开通 `im:message.reactions:write_only` 并发布权限变更 |
-| 一直提示会话忙 | `/status` 的 App Server 是否已连接、Codex Desktop 是否正在写同一 session；本地过期租约会自动释放 |
+| 一直提示会话忙 | 先处理占用卡片；A 会等待本地入口释放，B 可立即创建独立会话。Hub 租约会自动过期，但不会删除外部 writer 锁 |
 
 更多说明见[运维手册的故障排查章节](docs/OPERATIONS.md#故障排查)。
 

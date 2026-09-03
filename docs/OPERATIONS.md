@@ -25,12 +25,14 @@ node .\dist\cli\index.js service remove
 
 `service stop` 会写入本地停止请求。运行时收到请求后依次停止接收新事件、停止 TurnQueue 领取新任务、取消活动 Codex 进程树、等待任务状态落库、完成投递器收尾，最后关闭 SQLite。尚未领取的持久化 Turn 会留到下次启动。正常停止后，计划任务上次结果应为 `0`。
 
+计划任务使用 `IgnoreNew` 保持单实例运行；请不要在同一状态目录手动再启动第二个 `start` 进程。若确实需要隔离实例，请为每个实例配置独立的 `LARK_CODEX_HUB_HOME`、飞书凭据和计划任务。
+
 ## 状态目录
 
 默认目录为 `%USERPROFILE%\.lark-codex-hub`。可通过 `LARK_CODEX_HUB_HOME` 使用隔离目录。
 
 ```text
-config.v5.json          非敏感配置、项目发现和运行参数
+config.v6.json          非敏感配置、项目发现和运行参数
 secrets.v2.json         当前用户 DPAPI 加密的飞书凭据
 hub.sqlite              SQLite 主数据库
 hub.sqlite-wal          WAL 日志，服务运行时可能存在
@@ -52,7 +54,7 @@ node .\dist\cli\index.js service status
 
 `doctor` 会检查：
 
-- `config.v5.json` 是否符合配置 Schema。
+- `config.v6.json` 是否符合配置 Schema。
 - DPAPI 凭据是否能被当前 Windows 用户读取。
 - 已发现会话的真实工作目录是否可用且不属于危险根目录。
 - Codex CLI 版本、App Server 初始化以及只读 `thread/list` 是否可用。该检查不会执行真实 Turn，不能代替端到端消息验证。
@@ -122,6 +124,7 @@ DPAPI 凭据只能由创建它们的 Windows 用户在原 Windows 安全上下�
 - `running` 的 Codex 记录和 `executing` 的飞书动作会标记为 `interrupted`。
 - 遗留的思考、执行或输入表情会尝试清理。
 - 资源租约过期后可以重新获得，不需要手工删除锁文件。
+- 会话占用的等待/分支选择会在重启后恢复；如果分支入队或重试子任务在崩溃点未完成，Hub 会安全标记为失败而不自动重跑，确认文件状态后可用 `/retry` 手动继续。
 
 如果 `doctor` 报告 SQLite 完整性不是 `ok`，请先停止服务并保存所有 `hub.sqlite*` 文件，再进行任何修复。
 
@@ -129,7 +132,9 @@ DPAPI 凭据只能由创建它们的 Windows 用户在原 Windows 安全上下�
 
 发送 `/projects` 和 `/sessions` 可以按工作目录查看 Codex 全局持久化会话；Desktop 保存的项目名称会作为可选显示别名。发送 `/resume <ID>` 或使用恢复按钮只更新飞书绑定，不会加载 thread，也不会占用 writer。
 
-Desktop、VS Code、CLI 和 Hub 使用同一套 Codex 持久化历史，但各自拥有独立 App Server。同一个 thread 同一时间只能有一个 writer：本地客户端已经加载目标会话时，机器人会显示占用卡片；让本地客户端释放会话后点击“重新执行”即可重新入队，无需重新发送提示。
+Desktop、VS Code、CLI 和 Hub 使用同一套 Codex 持久化历史，但各自拥有独立 App Server。同一个 thread 同一时间只能有一个 writer。外部入口已经加载目标会话时，机器人会显示 A/B 占用卡片：A 会冻结原会话目标并等待释放后自动重试；B 会在同一项目目录创建空白独立会话并执行原始消息；取消则保留原绑定。
+
+A/B 卡片按批次保存原始消息、会话 ID 和工作目录，每次待处理选择只能领取一次，过期或已结束的卡片会失效。A 等待重试期间会更新同一张卡片，不会每 5 秒新增一条提醒；等待中的状态卡会提供刷新和取消入口，也可以发送 `/cancel`。B 不继承历史，且与本地入口同时操作同一目录时仍可能产生文件冲突。
 
 最后一个飞书 Turn 完成、失败或取消后，Hub 会回收自己的 App Server 并释放 writer。该交接不是界面实时镜像，其他客户端必要时需要刷新会话列表。
 
@@ -163,7 +168,8 @@ node .\dist\cli\index.js service remove
 
 - 发送 `/status`，确认 App Server 的“基础连接”可用，并检查“最近执行”是否成功；基础连接可用不代表最近一条消息执行成功。
 - 检查 Codex Desktop、VS Code 或其他 Codex CLI 是否正在持有同一 session。
-- 发送 `/queue` 检查排队消息；同一范围的新消息会排队，不应再因 Hub 自身并发而失败。
+- 如果出现 A/B 卡片，优先点击 A；需要马上执行时点击 B。A 需要本地入口完整退出或释放该会话，Hub 不会强制删除外部锁。
+- 发送 `/queue` 检查排队消息；同一范围的新消息会先等待占用选择，避免误投到已切换的会话。
 - Hub 租约有过期机制；服务异常退出后无需删除文件锁。
 
 ### 快捷菜单没有反应

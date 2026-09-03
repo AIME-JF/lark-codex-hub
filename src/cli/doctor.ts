@@ -8,6 +8,7 @@ import {
 } from "../adapters/sqlite/database.js";
 import { SqliteStateStore } from "../adapters/sqlite/state-store.js";
 import { scheduledTaskStatus } from "../adapters/windows/scheduled-task.js";
+import { windowsBootId } from "../adapters/windows/windows-lifecycle.js";
 import { resolveCommand } from "../adapters/process/command-resolver.js";
 import { NodeWorkspaceResolver } from "../adapters/fs/node-workspace-resolver.js";
 import { CodexAppServerAgent } from "../adapters/codex/codex-app-server-agent.js";
@@ -68,7 +69,7 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
   let config;
   try {
     config = await new FileConfigStore(home).load();
-    checks.push({ name: "配置", ok: true, detail: "config.v5.json 有效" });
+    checks.push({ name: "配置", ok: true, detail: "config.v6.json 有效" });
   } catch (error) {
     checks.push({ name: "配置", ok: false, detail: String(error) });
     return checks;
@@ -184,12 +185,24 @@ export async function runDoctor(home: string): Promise<DoctorCheck[]> {
 
   if (process.platform === "win32") {
     try {
+      const bootId = await windowsBootId();
+      checks.push({
+        name: "Windows 生命周期",
+        ok: Boolean(bootId),
+        detail: bootId ? `启动标识可读取：${bootId}` : "无法读取启动标识"
+      });
+    } catch (error) {
+      checks.push({ name: "Windows 生命周期", ok: false, detail: String(error) });
+    }
+    try {
       const status = await scheduledTaskStatus();
       checks.push({
         name: "静默启动",
-        ok: !status.installed || status.state === "Running",
+        ok:
+          !status.installed ||
+          (status.state === "Running" && status.lifecycleInstalled),
         detail: status.installed
-          ? `计划任务状态：${status.state ?? "未知"}；上次结果：${String(status.lastTaskResult ?? "未知")}`
+          ? `启动任务：${status.state ?? "未知"}（上次结果 ${String(status.lastTaskResult ?? "未知")}）；关机事件任务：${status.lifecycleInstalled ? status.lifecycleState ?? "未知" : "未安装"}`
           : "尚未安装（可选）"
       });
     } catch (error) {

@@ -170,8 +170,6 @@ export class CodexExecAgent implements CodingAgent {
   private arguments(request: ExecutionRequest): string[] {
     const execOptions = [
       "--json",
-      "--color",
-      "never",
       "-c",
       'approval_policy="never"',
       "--sandbox",

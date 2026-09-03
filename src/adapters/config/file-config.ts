@@ -14,7 +14,8 @@ function migrateLegacyConfig(value: unknown): HubConfig {
   if (
     legacy.schemaVersion !== 2 &&
     legacy.schemaVersion !== 3 &&
-    legacy.schemaVersion !== 4
+    legacy.schemaVersion !== 4 &&
+    legacy.schemaVersion !== 5
   ) {
     throw new Error(`不支持的配置版本：${String(legacy.schemaVersion)}`);
   }
@@ -27,12 +28,22 @@ function migrateLegacyConfig(value: unknown): HubConfig {
   const projects = legacy.projects && typeof legacy.projects === "object"
     ? legacy.projects as Record<string, unknown>
     : {};
+  const notifications = legacy.notifications && typeof legacy.notifications === "object"
+    ? legacy.notifications as Record<string, unknown>
+    : {};
   return hubConfigSchema.parse({
     ...rest,
-    schemaVersion: 5,
+    schemaVersion: 6,
     projects: {
       cacheSeconds: projects.cacheSeconds ?? 30,
       pendingPromptMinutes: projects.pendingPromptMinutes ?? 30
+    },
+    notifications: {
+      ...notifications,
+      lifecycle: notifications.lifecycle ?? {
+        mode: "all",
+        heartbeatSeconds: 30
+      }
     }
   });
 }
@@ -42,8 +53,9 @@ export class FileConfigStore {
   private readonly legacyPaths: readonly string[];
 
   public constructor(home: string) {
-    this.path = join(home, "config.v5.json");
+    this.path = join(home, "config.v6.json");
     this.legacyPaths = [
+      join(home, "config.v5.json"),
       join(home, "config.v4.json"),
       join(home, "config.v3.json"),
       join(home, "config.v2.json")

@@ -189,7 +189,11 @@ export class CodexAppServerAgent implements CodingAgent {
       const result = await this.client.request<unknown>("thread/fork", params);
       const thread = record(result)?.thread;
       const forked = toThreadSummary(thread);
-      this.loadedThreads.add(forked.id);
+      // thread/fork may load the child in this App Server. Do not retain that
+      // loaded writer after returning only a catalog entry: migration callers
+      // bind the ID and resume it later, while another client may otherwise be
+      // blocked by a Hub-owned writer that is no longer actively used.
+      await this.releaseThread(forked.id);
       return forked;
     });
   }
@@ -308,7 +312,7 @@ export class CodexAppServerAgent implements CodingAgent {
         clientInfo: {
           name: "lark_codex_hub",
           title: "Lark Codex Hub",
-          version: "1.5.0"
+          version: "1.6.0"
         },
         capabilities: {
           experimentalApi: false,

@@ -17,5 +17,7 @@ describe("Windows 静默启动脚本", () => {
     expect(output.runner).toContain("$ErrorActionPreference = 'Continue'");
     expect(output.runner).toContain("$serviceExitCode = $LASTEXITCODE");
     expect(output.vbs).toContain("WScript.Quit exitCode");
+    expect(output.lifecycleRunner).toContain("lifecycle-event windows-power");
+    expect(output.lifecycleVbs).toContain("-WindowStyle Hidden");
   });
 });

@@ -8,6 +8,18 @@ import type {
   TurnJobRecord,
   TurnJobState
 } from "../contracts/jobs.js";
+import type {
+  LifecycleEventRecord,
+  LifecycleStateRecord,
+  LifecycleStopReason
+} from "../contracts/lifecycle.js";
+import type {
+  SessionConflictChoice,
+  SessionConflictPatch,
+  SessionConflictRecord,
+  SessionConflictState,
+  TurnTarget
+} from "../contracts/session-routing.js";
 
 export interface RunRecord {
   id: string;
@@ -61,6 +73,12 @@ export interface TurnLaneRecord {
   scopeKey: string;
 }
 
+export interface SessionConflictRetryResult {
+  updated: boolean;
+  inserted: number;
+  retargeted: number;
+}
+
 export interface PendingPromptRecord {
   scopeKey: string;
   message: InboundMessage;
@@ -78,6 +96,12 @@ export interface NewSessionIntentRecord {
 export interface StateRepository {
   migrate(): void;
   close(): void;
+  beginLifecycleInstance(record: LifecycleStateRecord): LifecycleStateRecord | undefined;
+  heartbeatLifecycle(instanceId: string, now: number): boolean;
+  finishLifecycle(instanceId: string, reason: LifecycleStopReason, now: number): boolean;
+  recordLifecycleEvent(record: LifecycleEventRecord): boolean;
+  getLatestLifecycleEvent(after: number): LifecycleEventRecord | undefined;
+  markLifecycleEventDelivered(key: string, at: number): void;
   claimInbox(eventId: string, messageId: string, now: number): boolean;
   pruneInbox(before: number): number;
   enqueueInbound(eventId: string, messageId: string, payload: InboundJobPayload, now: number): boolean;
@@ -114,6 +138,14 @@ export interface StateRepository {
   getLatestRun(scopeKey: string): RunRecord | undefined;
   interruptRunningRuns(now: number): number;
   enqueueTurnJob(record: TurnJobRecord): boolean;
+  getTurnJob(id: string): TurnJobRecord | undefined;
+  /** Retarget deferred pending jobs without changing their event identity. */
+  retargetPendingTurnJobs(
+    ids: readonly string[],
+    target: TurnTarget,
+    laneKey: string,
+    now: number
+  ): number;
   getRetryableTurn(scopeKey: string, id?: string): TurnJobRecord | undefined;
   listReadyTurnLanes(before: number, limit: number): TurnLaneRecord[];
   claimTurnBatch(
@@ -133,6 +165,54 @@ export interface StateRepository {
   listPendingTurns(scopeKey: string, limit: number): TurnJobRecord[];
   countPendingTurns(scopeKey: string): number;
   recoverTurnJobs(now: number): TurnJobRecord[];
+  /** Persist and inspect an external-writer conflict decision. */
+  saveSessionConflict(record: SessionConflictRecord): void;
+  getSessionConflict(id: string): SessionConflictRecord | undefined;
+  listSessionConflicts(
+    states: readonly SessionConflictState[]
+  ): SessionConflictRecord[];
+  getOpenSessionConflict(scopeKey: string, now?: number): SessionConflictRecord | undefined;
+  /**
+   * Atomically consume the one-time card token and record the user's choice.
+   * Returns the updated record, or undefined for a stale/unauthorized click.
+   */
+  claimSessionConflict(
+    id: string,
+    token: string,
+    operatorOpenId: string,
+    chatId: string,
+    scopeKey: string,
+    choice: SessionConflictChoice,
+    now: number,
+    cardMessageId?: string
+  ): SessionConflictRecord | undefined;
+  updateSessionConflict(
+    id: string,
+    patch: SessionConflictPatch,
+    now: number,
+    expectedStates?: readonly SessionConflictState[]
+  ): boolean;
+  /** Rotate a conflict card token so previously rendered cards cannot act on a new attempt. */
+  rotateSessionConflictToken(
+    id: string,
+    expectedToken: string,
+    nextToken: string,
+    now: number
+  ): boolean;
+  /** Atomically transition a conflict and persist its retry child batch. */
+  commitSessionConflictRetry(
+    conflictId: string,
+    expectedState: SessionConflictState,
+    target: TurnTarget,
+    laneKey: string,
+    attempts: number,
+    childRecords: readonly TurnJobRecord[],
+    retargetJobIds: readonly string[],
+    supersedeJobIds: readonly string[],
+    supersedeError: string,
+    now: number
+  ): SessionConflictRetryResult;
+  listTurnJobsByConflict(scopeKey: string, conflictId: string): TurnJobRecord[];
   saveLiveCard(record: LiveCardRecord): void;
   getLiveCard(runId: string): LiveCardRecord | undefined;
   listActiveLiveCards(): LiveCardRecord[];
@@ -148,7 +228,8 @@ export interface StateRepository {
   failOutbox(id: number, attempts: number, error: string): void;
   enqueueDelivery(record: DeliveryRequest, now: number): boolean;
   claimDelivery(holder: string, now: number, ttlMs: number): DeliveryRecord | undefined;
-  completeDelivery(id: number, holder: string, now: number): void;
+  /** Mark a claimed delivery complete; false means it was stale/superseded. */
+  completeDelivery(id: number, holder: string, now: number): boolean;
   retryDelivery(id: number, holder: string, attempts: number, retryAt: number, error: string): void;
   failDelivery(id: number, holder: string, attempts: number, now: number, error: string): void;
   savePendingAction(record: PendingActionRecord, now: number): void;

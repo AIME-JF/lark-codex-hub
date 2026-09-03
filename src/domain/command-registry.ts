@@ -1,4 +1,10 @@
 import type { CardAction } from "../contracts/presentation.js";
+import type {
+  SessionConflictChoice,
+  SessionConflictRecord
+} from "../contracts/session-routing.js";
+
+export type { SessionConflictChoice } from "../contracts/session-routing.js";
 
 export type CommandId =
   | "help"
@@ -56,7 +62,15 @@ export const commandDefinitions: readonly CommandDefinition[] = [
   { id: "history", aliases: ["/history"], usage: "/history [页码]", description: "分页查看当前会话对话", category: "会话与任务", menuEventKey: "hub_history" },
   { id: "queue", aliases: ["/queue"], usage: "/queue", description: "查看等待执行的消息", category: "会话与任务", menuEventKey: "hub_queue" },
   { id: "cancel", aliases: ["/cancel"], usage: "/cancel", description: "取消当前任务并清空排队消息", category: "会话与任务", menuEventKey: "hub_cancel" },
-  { id: "new", aliases: ["/new"], usage: "/new", description: "在当前项目创建新会话", category: "项目与会话", menuEventKey: "hub_new" },
+  {
+    id: "new",
+    // 中文别名只做整句匹配（parseRegisteredCommand），不会误伤普通提示词。
+    aliases: ["/new", "新建会话", "开始新会话", "新对话"],
+    usage: "/new",
+    description: "在当前项目创建新会话",
+    category: "项目与会话",
+    menuEventKey: "hub_new"
+  },
   { id: "resume", aliases: ["/resume"], usage: "/resume <会话 ID 或序号>", description: "绑定当前项目内的 Codex 会话", category: "项目与会话" },
   { id: "retry", aliases: ["/retry"], usage: "/retry [任务编号]", description: "重新执行最近一次会话占用任务", category: "会话与任务", hidden: true },
   { id: "steer", aliases: ["/steer"], usage: "/steer <补充指令>", description: "向正在执行的任务追加指令", category: "会话与任务" },
@@ -124,6 +138,69 @@ export function registeredCommandAction(
     style,
     value: { command: "registered_command", id, ...(args ? { args } : {}) }
   };
+}
+
+/** 构造会话占用卡片中的一次性 A/B/取消按钮。 */
+export function sessionConflictAction(
+  label: string,
+  choice: SessionConflictChoice,
+  conflictId: string,
+  token: string,
+  style: CardAction["style"] = "default"
+): CardAction {
+  return {
+    label,
+    style,
+    value: {
+      command: "session_conflict",
+      choice,
+      conflictId,
+      token
+    }
+  };
+}
+
+/** Build the standard A/B/cancel action row for a conflict record. */
+export function sessionConflictActions(
+  conflict: Pick<SessionConflictRecord, "id" | "token" | "state">,
+  includeCancel = true
+): CardAction[] {
+  if (conflict.state !== "pending") {
+    return [
+      registeredCommandAction("刷新状态", "status", "", "primary"),
+      ...(includeCancel
+        ? [registeredCommandAction("取消等待", "cancel", "", "danger")]
+        : [])
+    ];
+  }
+  const actions: CardAction[] = [
+    sessionConflictAction(
+      "A 等待释放后继续",
+      "wait",
+      conflict.id,
+      conflict.token,
+      "primary"
+    ),
+    sessionConflictAction(
+      "B 新建独立会话",
+      "branch",
+      conflict.id,
+      conflict.token,
+      "default"
+    )
+  ];
+  if (includeCancel) {
+    actions.push(
+      sessionConflictAction(
+        "取消本次请求",
+        "cancel",
+        conflict.id,
+        conflict.token,
+        "danger"
+      )
+    );
+  }
+  return actions;
 }
 
 export function commandHelp(category?: CommandCategory): string {

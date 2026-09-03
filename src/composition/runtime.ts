@@ -10,6 +10,10 @@ import { resolveCommand } from "../adapters/process/command-resolver.js";
 import { createSecretVault } from "../adapters/secrets/create-vault.js";
 import { openDatabase } from "../adapters/sqlite/database.js";
 import { SqliteStateStore } from "../adapters/sqlite/state-store.js";
+import {
+  latestWindowsPowerEvent,
+  windowsBootId
+} from "../adapters/windows/windows-lifecycle.js";
 import { HubController } from "../application/hub-controller.js";
 import { DeliveryWorker } from "../application/delivery-worker.js";
 import { InboundWorker } from "../application/inbound-worker.js";
@@ -22,12 +26,14 @@ import { ProjectCatalogService } from "../application/project-catalog-service.js
 import { ProjectNavigationService } from "../application/project-navigation-service.js";
 import { SessionCatalogService } from "../application/session-catalog-service.js";
 import { TurnQueueService } from "../application/turn-queue-service.js";
+import { LifecycleNotificationService } from "../application/lifecycle-notification-service.js";
 import { createLogger, type Logger } from "../observability/logger.js";
 import { presentation } from "../application/presentation-factory.js";
 import type { CodingAgent } from "../ports/coding-agent.js";
+import type { LifecycleStopReason } from "../contracts/lifecycle.js";
 
 export interface HubRuntime {
-  close(): Promise<void>;
+  close(reason?: LifecycleStopReason): Promise<void>;
 }
 
 export async function startRuntime(home: string): Promise<HubRuntime> {
@@ -92,6 +98,31 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
     config.notifications.maxAttempts,
     logger
   );
+  const lifecycle = new LifecycleNotificationService(
+    store,
+    deliveries,
+    config.feishu.ownerOpenId,
+    config.notifications.enabled ? config.notifications.lifecycle.mode : "off",
+    config.notifications.lifecycle.heartbeatSeconds,
+    logger
+  );
+  let bootId = `unknown:${String(process.pid)}`;
+  try {
+    bootId = await windowsBootId();
+  } catch (error) {
+    logger.warn("无法读取 Windows 启动标识，断电判断将降级", {
+      error: String(error)
+    });
+  }
+  let powerEvent;
+  try {
+    powerEvent = await latestWindowsPowerEvent();
+  } catch (error) {
+    logger.warn("无法读取 Windows 关机事件，断电判断将降级", {
+      error: String(error)
+    });
+  }
+  lifecycle.begin(bootId, powerEvent);
   const liveCards = new LiveCardService(
     messenger,
     store,
@@ -119,7 +150,8 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
     deliveries,
     workspaces,
     logger,
-    liveCards
+    liveCards,
+    () => projectCatalog.invalidate()
   );
   const turns = new TurnQueueService(
     store,
@@ -163,8 +195,14 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
   await messenger.connect(
     async (message) => inbound.submitMessage(message),
     async (action) => inbound.submitCardAction(action),
-    async (action) => inbound.submitBotMenu(action)
+    async (action) => inbound.submitBotMenu(action),
+    async (event) => {
+      if (event.type === "reconnected") {
+        lifecycle.notifyConnectionRecovered(event.durationMs);
+      }
+    }
   );
+  lifecycle.ready();
   await new RecoveryService(
     store,
     deliveries,
@@ -194,11 +232,13 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
 
   let closed = false;
   return {
-    close: async () => {
+    close: async (reason = "runtime_close") => {
       if (closed) {
         return;
       }
       closed = true;
+      lifecycle.notifyStopping(reason);
+      await deliveries.flush();
       await inbound.stopAndDrain();
       turns.stopClaiming();
       await agent.shutdown(config.runtime.shutdownGraceSeconds * 1_000);
@@ -206,6 +246,7 @@ export async function startRuntime(home: string): Promise<HubRuntime> {
       await deliveries.stopAndDrain();
       liveCards.close();
       await messenger.close();
+      lifecycle.finish(reason);
       logger.info("Lark Codex Hub 已停止");
       store.close();
     }

@@ -7,6 +7,8 @@ import { FileConfigStore } from "../adapters/config/file-config.js";
 import { createSecretVault } from "../adapters/secrets/create-vault.js";
 import { openDatabase } from "../adapters/sqlite/database.js";
 import { SqliteStateStore } from "../adapters/sqlite/state-store.js";
+import { FeishuMessenger } from "../adapters/feishu/feishu-messenger.js";
+import { latestWindowsPowerEvent } from "../adapters/windows/windows-lifecycle.js";
 import {
   installScheduledTask,
   removeScheduledTask,
@@ -17,10 +19,15 @@ import {
   createDefaultConfig,
   defaultHome
 } from "../contracts/config.js";
-import { startRuntime } from "../composition/runtime.js";
+import { runtimeLogger, startRuntime } from "../composition/runtime.js";
 import { runDoctor } from "./doctor.js";
 import { errorMessage } from "../observability/logger.js";
 import { presentation } from "../application/presentation-factory.js";
+import {
+  lifecycleNotificationEnabled,
+  windowsPowerPresentation
+} from "../application/lifecycle-notification-service.js";
+import type { LifecycleStopReason } from "../contracts/lifecycle.js";
 
 const args = process.argv.slice(2);
 
@@ -79,26 +86,103 @@ async function start(home: string): Promise<void> {
   await new Promise<void>((resolveShutdown) => {
     let stopping = false;
     let stopWatcher: NodeJS.Timeout;
-    const shutdown = (): void => {
+    const shutdown = (reason: LifecycleStopReason): void => {
       if (stopping) {
         return;
       }
       stopping = true;
       clearInterval(stopWatcher);
-      void runtime.close().finally(resolveShutdown);
+      void runtime.close(reason).finally(resolveShutdown);
     };
     stopWatcher = setInterval(() => {
       void readFile(stopRequest, "utf8")
         .then(async () => {
           await rm(stopRequest, { force: true });
-          shutdown();
+          shutdown("service_stop");
         })
         .catch(() => undefined);
     }, 500);
     stopWatcher.unref();
-    process.once("SIGINT", shutdown);
-    process.once("SIGTERM", shutdown);
+    process.once("SIGINT", () => shutdown("sigint"));
+    process.once("SIGTERM", () => shutdown("sigterm"));
   });
+}
+
+async function handleLifecycleEvent(home: string): Promise<void> {
+  if (args[1] !== "windows-power") {
+    throw new Error("不支持的内部生命周期事件。");
+  }
+  const event = await latestWindowsPowerEvent();
+  if (!event) {
+    throw new Error("未找到 Windows 关机或重启事件。");
+  }
+  const config = await new FileConfigStore(home).load();
+  const store = new SqliteStateStore(openDatabase(join(home, "hub.sqlite")));
+  store.migrate();
+  store.recordLifecycleEvent({
+    key: event.key,
+    kind: event.kind,
+    occurredAt: event.occurredAt,
+    detailsJson: JSON.stringify(event)
+  });
+  const recorded = store.getLatestLifecycleEvent(event.occurredAt);
+  if (recorded?.key === event.key && recorded.deliveredAt) {
+    store.close();
+    process.stdout.write("Windows 生命周期事件已通知，跳过重复发送。\n");
+    return;
+  }
+  const mode = config.notifications.enabled
+    ? config.notifications.lifecycle.mode
+    : "off";
+  if (!lifecycleNotificationEnabled(mode, "windows_power")) {
+    store.close();
+    process.stdout.write("Windows 生命周期事件已记录，通知策略未启用。\n");
+    return;
+  }
+
+  const idempotencyKey = `lifecycle:windows:${event.key}`;
+  const card = windowsPowerPresentation(event);
+  const vault = createSecretVault(home);
+  const appId = await vault.get("feishu.app_id");
+  const appSecret = await vault.get("feishu.app_secret");
+  if (!appId || !appSecret) {
+    store.close();
+    throw new Error("未找到飞书 App ID/App Secret，无法发送关机提醒。");
+  }
+  const messenger = new FeishuMessenger(
+    appId,
+    appSecret,
+    config.feishu.domain,
+    config.presentation.cardsEnabled,
+    runtimeLogger(home)
+  );
+  try {
+    await messenger.sendCard(
+      { type: "open_id", id: config.feishu.ownerOpenId },
+      card,
+      idempotencyKey
+    );
+    store.markLifecycleEventDelivered(event.key, Date.now());
+    process.stdout.write("Windows 生命周期提醒已发送。\n");
+  } catch (error) {
+    store.enqueueDelivery(
+      {
+        idempotencyKey,
+        target: {
+          kind: "send",
+          type: "open_id",
+          id: config.feishu.ownerOpenId
+        },
+        card
+      },
+      Date.now()
+    );
+    process.stdout.write(
+      `Windows 生命周期提醒暂未直达，已进入持久队列：${errorMessage(error)}\n`
+    );
+  } finally {
+    store.close();
+  }
 }
 
 async function doctor(home: string): Promise<void> {
@@ -145,7 +229,7 @@ async function service(home: string): Promise<void> {
       installRoot,
       nodeExecutable: process.execPath
     });
-    process.stdout.write("静默启动计划任务已安装，尚未启动。\n");
+    process.stdout.write("静默启动与 Windows 关机提醒计划任务已安装，尚未启动。\n");
     return;
   }
   if (action === "remove") {
@@ -250,6 +334,8 @@ async function main(): Promise<void> {
     await service(home);
   } else if (command === "notify") {
     await notify(home);
+  } else if (command === "lifecycle-event") {
+    await handleLifecycleEvent(home);
   } else if (command === "help" || command === "--help" || command === "-h") {
     usage();
   } else {

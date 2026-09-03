@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 
-export const LATEST_SCHEMA_VERSION = 7;
+export const LATEST_SCHEMA_VERSION = 9;
 
 const latestSchema = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS turn_jobs (
   event_id TEXT NOT NULL UNIQUE,
   scope_key TEXT NOT NULL,
   lane_key TEXT NOT NULL,
+  target_json TEXT,
   message_json TEXT NOT NULL,
   prompt TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN (
@@ -112,6 +113,38 @@ CREATE TABLE IF NOT EXISTS turn_jobs (
 );
 CREATE INDEX IF NOT EXISTS turn_jobs_ready_idx
   ON turn_jobs(status, lane_key, scope_key, created_at);
+CREATE INDEX IF NOT EXISTS turn_jobs_target_idx
+  ON turn_jobs(scope_key, target_json, created_at);
+
+CREATE TABLE IF NOT EXISTS session_conflicts (
+  id TEXT PRIMARY KEY,
+  token TEXT NOT NULL UNIQUE,
+  scope_key TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  operator_open_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  job_ids_json TEXT NOT NULL,
+  target_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN (
+    'pending', 'waiting', 'branching', 'retrying',
+    'resolved', 'cancelled', 'failed', 'expired'
+  )),
+  choice TEXT CHECK(choice IN ('wait', 'branch', 'cancel')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER,
+  expires_at INTEGER NOT NULL,
+  card_message_id TEXT,
+  holder TEXT,
+  lease_expires_at INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  resolved_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS session_conflicts_scope_state_idx
+  ON session_conflicts(scope_key, state, updated_at DESC);
+CREATE INDEX IF NOT EXISTS session_conflicts_due_idx
+  ON session_conflicts(state, next_attempt_at, expires_at);
 
 CREATE TABLE IF NOT EXISTS live_cards (
   run_id TEXT PRIMARY KEY,
@@ -206,6 +239,27 @@ CREATE TABLE IF NOT EXISTS action_requests (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS lifecycle_state (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  instance_id TEXT NOT NULL,
+  boot_id TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  heartbeat_at INTEGER NOT NULL,
+  clean INTEGER NOT NULL DEFAULT 0,
+  stopped_at INTEGER,
+  stop_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+  event_key TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK(kind IN ('system_shutdown', 'system_restart')),
+  occurred_at INTEGER NOT NULL,
+  details_json TEXT NOT NULL,
+  delivered_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS lifecycle_events_time_idx
+  ON lifecycle_events(occurred_at DESC);
 `;
 
 function currentVersion(database: Database.Database): number {
@@ -337,6 +391,26 @@ function migrateToVersion7(database: Database.Database): void {
     .run(Date.now());
 }
 
+function migrateToVersion8(database: Database.Database): void {
+  database.exec(latestSchema);
+  database
+    .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(8, ?)")
+    .run(Date.now());
+}
+
+function migrateToVersion9(database: Database.Database): void {
+  const columns = database.pragma("table_info(turn_jobs)") as Array<{
+    name: string;
+  }>;
+  if (!columns.some((column) => column.name === "target_json")) {
+    database.exec("ALTER TABLE turn_jobs ADD COLUMN target_json TEXT");
+  }
+  database.exec(latestSchema);
+  database
+    .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(9, ?)")
+    .run(Date.now());
+}
+
 function migrateLegacyProjectPreferences(database: Database.Database): void {
   const legacy = database
     .prepare("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = 'workspace_preferences'")
@@ -347,6 +421,94 @@ function migrateLegacyProjectPreferences(database: Database.Database): void {
         SELECT scope_key, cwd, updated_at FROM workspace_preferences;
       DELETE FROM workspace_preferences;
     `);
+  }
+}
+
+interface DeliveryRepairRow {
+  id: number;
+  target_json: string;
+  target_key: string | null;
+  revision: number | null;
+  created_at: number;
+}
+
+/**
+ * Backfill update-card ordering metadata for rows written before schema v6.
+ *
+ * The delivery worker uses target_key/revision to prevent an expired worker
+ * lease from sending an obsolete card after a newer update. Rows created by
+ * the v5 -> v6 migration have NULL metadata, so leave them unprotected unless
+ * we derive the key here. The repair is deterministic and idempotent: rows are
+ * ordered by their original insertion time, while an existing target version
+ * remains a monotonic floor so historical pruning cannot make revisions go
+ * backwards.
+ */
+function repairDeliveryRevisions(database: Database.Database): void {
+  const rows = database
+    .prepare(
+      `SELECT id, target_json, target_key, revision, created_at
+       FROM delivery_outbox
+       ORDER BY id ASC`
+    )
+    .all() as DeliveryRepairRow[];
+  const groups = new Map<string, DeliveryRepairRow[]>();
+  for (const row of rows) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.target_json);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    const target = parsed as Record<string, unknown>;
+    if (target.kind !== "update" || typeof target.messageId !== "string" || !target.messageId) {
+      continue;
+    }
+    const key = `card:${target.messageId}`;
+    const group = groups.get(key) ?? [];
+    group.push(row);
+    groups.set(key, group);
+  }
+
+  const latest = database.prepare(
+    "SELECT revision FROM delivery_target_versions WHERE target_key = ?"
+  );
+  const update = database.prepare(
+    `UPDATE delivery_outbox
+     SET target_key = ?, revision = ?
+     WHERE id = ?`
+  );
+  const upsert = database.prepare(
+    `INSERT INTO delivery_target_versions(target_key, revision)
+     VALUES(?, ?)
+     ON CONFLICT(target_key) DO UPDATE SET
+       revision = CASE
+         WHEN delivery_target_versions.revision < excluded.revision
+         THEN excluded.revision
+         ELSE delivery_target_versions.revision
+       END`
+  );
+
+  for (const [targetKey, group] of groups) {
+    group.sort((left, right) =>
+      left.created_at - right.created_at || left.id - right.id
+    );
+    const current = latest.get(targetKey) as { revision: number } | undefined;
+    const existingMax = group.reduce(
+      (max, row) => Math.max(max, row.revision ?? 0),
+      0
+    );
+    const floor = Math.max(current?.revision ?? 0, existingMax, group.length);
+    const firstRevision = floor - group.length + 1;
+    for (const [index, row] of group.entries()) {
+      const revision = firstRevision + index;
+      if (row.target_key !== targetKey || row.revision !== revision) {
+        update.run(targetKey, revision, row.id);
+      }
+    }
+    upsert.run(targetKey, floor);
   }
 }
 
@@ -378,6 +540,7 @@ export function migrateDatabase(database: Database.Database): void {
           .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)")
           .run(applied, Date.now());
       }
+      repairDeliveryRevisions(database);
       return;
     }
     if (version < 4) {
@@ -394,8 +557,17 @@ export function migrateDatabase(database: Database.Database): void {
     }
     if (version < 7) {
       migrateToVersion7(database);
+      version = currentVersion(database);
+    }
+    if (version < 8) {
+      migrateToVersion8(database);
+      version = currentVersion(database);
+    }
+    if (version < 9) {
+      migrateToVersion9(database);
     }
     database.exec(latestSchema);
     migrateLegacyProjectPreferences(database);
+    repairDeliveryRevisions(database);
   })();
 }

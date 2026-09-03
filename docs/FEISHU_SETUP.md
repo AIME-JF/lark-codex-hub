@@ -141,7 +141,7 @@ App Secret 只应输入本机安装命令。不要把它放进截图、Issue、�
 - 是否开通群聊提及消息权限。
 - 是否在群聊中明确提及机器人。
 - 机器人是否在群内。
-- `config.v5.json` 中的 `allowedChatIds` 是否限制了该群。
+- `config.v6.json` 中的 `allowedChatIds` 是否限制了该群。
 
 ### 卡片正常但按钮无效
 

@@ -15,6 +15,18 @@ import type {
   TerminalReaction
 } from "../../contracts/presentation.js";
 import type {
+  LifecycleEventRecord,
+  LifecycleStateRecord,
+  LifecycleStopReason
+} from "../../contracts/lifecycle.js";
+import type {
+  SessionConflictChoice,
+  SessionConflictPatch,
+  SessionConflictRecord,
+  SessionConflictState,
+  TurnTarget
+} from "../../contracts/session-routing.js";
+import type {
   ActiveReactionRecord,
   LiveCardRecord,
   NewSessionIntentRecord,
@@ -23,6 +35,7 @@ import type {
   PendingPromptRecord,
   RunRecord,
   StateRepository,
+  SessionConflictRetryResult,
   TurnLaneRecord
 } from "../../ports/state-repository.js";
 import { migrateDatabase } from "./database.js";
@@ -82,15 +95,62 @@ interface DeliveryRow {
   revision: number | null;
 }
 
+// Keep all delivery lifecycle transitions on the same revision predicate. A
+// row is current only when its keyed revision exactly matches the persisted
+// target version; NULL/missing versions must never win over a newer card.
+const deliveryLatestMatch = `
+  (
+    target_key IS NULL OR
+    (
+      revision IS NOT NULL AND EXISTS (
+        SELECT 1 FROM delivery_target_versions AS latest
+        WHERE latest.target_key = delivery_outbox.target_key
+          AND latest.revision = delivery_outbox.revision
+      )
+    )
+  )`;
+const deliveryIsStale = `
+  target_key IS NOT NULL AND NOT (
+    revision IS NOT NULL AND EXISTS (
+      SELECT 1 FROM delivery_target_versions AS latest
+      WHERE latest.target_key = delivery_outbox.target_key
+        AND latest.revision = delivery_outbox.revision
+    )
+  )`;
+
 interface TurnJobRow {
   id: string;
   event_id: string;
   scope_key: string;
   lane_key: string;
+  target_json: string | null;
   message_json: string;
   prompt: string;
   status: TurnJobState;
   created_at: number;
+}
+
+interface SessionConflictRow {
+  id: string;
+  token: string;
+  scope_key: string;
+  chat_id: string;
+  operator_open_id: string;
+  run_id: string;
+  job_ids_json: string;
+  target_json: string;
+  state: SessionConflictState;
+  choice: SessionConflictChoice | null;
+  attempts: number;
+  next_attempt_at: number | null;
+  expires_at: number;
+  card_message_id: string | null;
+  holder: string | null;
+  lease_expires_at: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+  resolved_at: number | null;
 }
 
 interface LiveCardRow {
@@ -119,6 +179,24 @@ interface PendingPromptRow {
   prompt: string;
   expires_at: number;
   created_at: number;
+}
+
+interface LifecycleStateRow {
+  instance_id: string;
+  boot_id: string;
+  started_at: number;
+  heartbeat_at: number;
+  clean: number;
+  stopped_at: number | null;
+  stop_reason: LifecycleStopReason | null;
+}
+
+interface LifecycleEventRow {
+  event_key: string;
+  kind: LifecycleEventRecord["kind"];
+  occurred_at: number;
+  details_json: string;
+  delivered_at: number | null;
 }
 
 function pendingPrompt(row: PendingPromptRow): PendingPromptRecord {
@@ -168,11 +246,13 @@ function delivery(row: DeliveryRow): DeliveryRecord {
 }
 
 function turnJob(row: TurnJobRow): TurnJobRecord {
+  const target = parseTurnTarget(row.target_json);
   return {
     id: row.id,
     eventId: row.event_id,
     scopeKey: row.scope_key,
     laneKey: row.lane_key,
+    ...(target ? { target } : {}),
     message: JSON.parse(row.message_json) as TurnJobRecord["message"],
     prompt: row.prompt,
     state: row.status,
@@ -204,6 +284,101 @@ function runRecord(row: RunRow): RunRecord {
   };
 }
 
+function parseTurnTarget(value: string | null): TurnTarget | undefined {
+  if (!value) {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object") {
+      return undefined;
+    }
+    const record = parsed as Record<string, unknown>;
+    const mode = record.mode;
+    const cwd = record.cwd;
+    const conflictId = typeof record.conflictId === "string" && record.conflictId
+      ? record.conflictId
+      : undefined;
+    if (typeof cwd !== "string" || !cwd) {
+      return undefined;
+    }
+    if (mode === "new") {
+      return { mode, cwd, ...(conflictId ? { conflictId } : {}) };
+    }
+    if (mode === "session" && typeof record.sessionId === "string" && record.sessionId) {
+      return {
+        mode,
+        sessionId: record.sessionId,
+        cwd,
+        ...(conflictId ? { conflictId } : {})
+      };
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sessionConflict(row: SessionConflictRow): SessionConflictRecord {
+  const target = parseTurnTarget(row.target_json);
+  if (!target || target.mode !== "session") {
+    throw new Error(`会话冲突记录 ${row.id} 的执行目标无效。`);
+  }
+  let jobIds: string[];
+  try {
+    const parsed: unknown = JSON.parse(row.job_ids_json);
+    jobIds = Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === "string" && value.length > 0)
+      : [];
+  } catch {
+    jobIds = [];
+  }
+  return {
+    id: row.id,
+    token: row.token,
+    scopeKey: row.scope_key,
+    chatId: row.chat_id,
+    operatorOpenId: row.operator_open_id,
+    runId: row.run_id,
+    jobIds,
+    target,
+    state: row.state,
+    ...(row.choice === null ? {} : { choice: row.choice }),
+    attempts: row.attempts,
+    ...(row.next_attempt_at === null ? {} : { nextAttemptAt: row.next_attempt_at }),
+    expiresAt: row.expires_at,
+    ...(row.card_message_id === null ? {} : { cardMessageId: row.card_message_id }),
+    ...(row.holder === null ? {} : { holder: row.holder }),
+    ...(row.lease_expires_at === null ? {} : { leaseExpiresAt: row.lease_expires_at }),
+    ...(row.last_error === null ? {} : { lastError: row.last_error }),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.resolved_at === null ? {} : { resolvedAt: row.resolved_at })
+  };
+}
+
+function lifecycleState(row: LifecycleStateRow): LifecycleStateRecord {
+  return {
+    instanceId: row.instance_id,
+    bootId: row.boot_id,
+    startedAt: row.started_at,
+    heartbeatAt: row.heartbeat_at,
+    clean: row.clean === 1,
+    ...(row.stopped_at === null ? {} : { stoppedAt: row.stopped_at }),
+    ...(row.stop_reason ? { stopReason: row.stop_reason } : {})
+  };
+}
+
+function lifecycleEvent(row: LifecycleEventRow): LifecycleEventRecord {
+  return {
+    key: row.event_key,
+    kind: row.kind,
+    occurredAt: row.occurred_at,
+    detailsJson: row.details_json,
+    ...(row.delivered_at === null ? {} : { deliveredAt: row.delivered_at })
+  };
+}
+
 export class SqliteStateStore implements StateRepository {
   public constructor(private readonly database: Database.Database) {}
 
@@ -213,6 +388,96 @@ export class SqliteStateStore implements StateRepository {
 
   public close(): void {
     this.database.close();
+  }
+
+  public beginLifecycleInstance(
+    record: LifecycleStateRecord
+  ): LifecycleStateRecord | undefined {
+    return this.database.transaction(() => {
+      const previous = this.database
+        .prepare(
+          `SELECT instance_id, boot_id, started_at, heartbeat_at,
+                  clean, stopped_at, stop_reason
+           FROM lifecycle_state WHERE singleton = 1`
+        )
+        .get() as LifecycleStateRow | undefined;
+      this.database
+        .prepare(
+          `INSERT INTO lifecycle_state(
+             singleton, instance_id, boot_id, started_at, heartbeat_at,
+             clean, stopped_at, stop_reason
+           ) VALUES(1, ?, ?, ?, ?, 0, NULL, NULL)
+           ON CONFLICT(singleton) DO UPDATE SET
+             instance_id = excluded.instance_id,
+             boot_id = excluded.boot_id,
+             started_at = excluded.started_at,
+             heartbeat_at = excluded.heartbeat_at,
+             clean = 0,
+             stopped_at = NULL,
+             stop_reason = NULL`
+        )
+        .run(record.instanceId, record.bootId, record.startedAt, record.heartbeatAt);
+      return previous ? lifecycleState(previous) : undefined;
+    })();
+  }
+
+  public heartbeatLifecycle(instanceId: string, now: number): boolean {
+    return this.database
+      .prepare(
+        `UPDATE lifecycle_state SET heartbeat_at = ?
+         WHERE singleton = 1 AND instance_id = ? AND clean = 0`
+      )
+      .run(now, instanceId).changes === 1;
+  }
+
+  public finishLifecycle(
+    instanceId: string,
+    reason: LifecycleStopReason,
+    now: number
+  ): boolean {
+    return this.database
+      .prepare(
+        `UPDATE lifecycle_state
+         SET heartbeat_at = ?, clean = 1, stopped_at = ?, stop_reason = ?
+         WHERE singleton = 1 AND instance_id = ? AND clean = 0`
+      )
+      .run(now, now, reason, instanceId).changes === 1;
+  }
+
+  public recordLifecycleEvent(record: LifecycleEventRecord): boolean {
+    return this.database
+      .prepare(
+        `INSERT OR IGNORE INTO lifecycle_events(
+           event_key, kind, occurred_at, details_json, delivered_at
+         ) VALUES(?, ?, ?, ?, ?)`
+      )
+      .run(
+        record.key,
+        record.kind,
+        record.occurredAt,
+        record.detailsJson,
+        record.deliveredAt ?? null
+      ).changes === 1;
+  }
+
+  public getLatestLifecycleEvent(after: number): LifecycleEventRecord | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT event_key, kind, occurred_at, details_json, delivered_at
+         FROM lifecycle_events WHERE occurred_at >= ?
+         ORDER BY occurred_at DESC LIMIT 1`
+      )
+      .get(after) as LifecycleEventRow | undefined;
+    return row ? lifecycleEvent(row) : undefined;
+  }
+
+  public markLifecycleEventDelivered(key: string, at: number): void {
+    this.database
+      .prepare(
+        `UPDATE lifecycle_events SET delivered_at = COALESCE(delivered_at, ?)
+         WHERE event_key = ?`
+      )
+      .run(at, key);
   }
 
   public claimInbox(eventId: string, messageId: string, now: number): boolean {
@@ -257,10 +522,16 @@ export class SqliteStateStore implements StateRepository {
       const cards = this.database
         .prepare("DELETE FROM live_cards WHERE updated_at < ? AND status = 'completed'")
         .run(before).changes;
+      const conflicts = this.database
+        .prepare(
+          `DELETE FROM session_conflicts
+           WHERE updated_at < ? AND state IN ('resolved', 'cancelled', 'failed', 'expired')`
+        )
+        .run(before).changes;
       const inbox = this.database
         .prepare("DELETE FROM inbox_dedup WHERE received_at < ?")
         .run(before).changes;
-      return inbound + deliveries + actions + turns + cards + inbox;
+      return inbound + deliveries + actions + turns + cards + conflicts + inbox;
     })();
   }
 
@@ -682,15 +953,16 @@ export class SqliteStateStore implements StateRepository {
     const result = this.database
       .prepare(
         `INSERT OR IGNORE INTO turn_jobs(
-           id, event_id, scope_key, lane_key, message_json, prompt,
+           id, event_id, scope_key, lane_key, target_json, message_json, prompt,
            status, created_at, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
       )
       .run(
         record.id,
         record.eventId,
         record.scopeKey,
         record.laneKey,
+        record.target ? JSON.stringify(record.target) : null,
         JSON.stringify(record.message),
         record.prompt,
         record.createdAt,
@@ -699,14 +971,139 @@ export class SqliteStateStore implements StateRepository {
     return result.changes === 1;
   }
 
+  public getTurnJob(id: string): TurnJobRecord | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT id, event_id, scope_key, lane_key, target_json, message_json, prompt,
+                status, created_at
+         FROM turn_jobs WHERE id = ?`
+      )
+      .get(id) as TurnJobRow | undefined;
+    return row ? turnJob(row) : undefined;
+  }
+
+  public retargetPendingTurnJobs(
+    ids: readonly string[],
+    target: TurnTarget,
+    laneKey: string,
+    now: number
+  ): number {
+    if (ids.length === 0) {
+      return 0;
+    }
+    const placeholders = ids.map(() => "?").join(", ");
+    return this.database
+      .prepare(
+        `UPDATE turn_jobs
+         SET target_json = ?, lane_key = ?, updated_at = ?
+         WHERE status = 'pending' AND id IN (${placeholders})`
+      )
+      .run(JSON.stringify(target), laneKey, now, ...ids).changes;
+  }
+
+  /**
+   * Atomically move a conflict into retrying and transfer all represented
+   * jobs to the frozen target. Keeping the CAS, child inserts, deferred-job
+   * retargeting and source supersession in one SQLite transaction prevents a
+   * process crash from leaving a half-created retry batch.
+   */
+  public commitSessionConflictRetry(
+    conflictId: string,
+    expectedState: SessionConflictState,
+    target: TurnTarget,
+    laneKey: string,
+    attempts: number,
+    childRecords: readonly TurnJobRecord[],
+    retargetJobIds: readonly string[],
+    supersedeJobIds: readonly string[],
+    supersedeError: string,
+    now: number
+  ): SessionConflictRetryResult {
+    return this.database.transaction(() => {
+      const updated = this.database
+        .prepare(
+          `UPDATE session_conflicts
+           SET state = 'retrying', attempts = ?, next_attempt_at = ?,
+               last_error = NULL, updated_at = ?
+           WHERE id = ? AND state = ?`
+        )
+        .run(attempts, now, now, conflictId, expectedState).changes === 1;
+      if (!updated) {
+        return { updated: false, inserted: 0, retargeted: 0 };
+      }
+
+      const insertChild = this.database.prepare(
+        `INSERT OR IGNORE INTO turn_jobs(
+           id, event_id, scope_key, lane_key, target_json, message_json, prompt,
+           status, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+      );
+      let inserted = 0;
+      for (const record of childRecords) {
+        inserted += insertChild.run(
+          record.id,
+          record.eventId,
+          record.scopeKey,
+          record.laneKey,
+          record.target ? JSON.stringify(record.target) : null,
+          JSON.stringify(record.message),
+          record.prompt,
+          record.createdAt,
+          record.createdAt
+        ).changes;
+      }
+
+      let retargeted = 0;
+      if (retargetJobIds.length > 0) {
+        const placeholders = retargetJobIds.map(() => "?").join(", ");
+        retargeted = this.database
+          .prepare(
+            `UPDATE turn_jobs
+             SET target_json = ?, lane_key = ?, updated_at = ?
+             WHERE status = 'pending' AND id IN (${placeholders})`
+          )
+          .run(
+            JSON.stringify(target),
+            laneKey,
+            now,
+            ...retargetJobIds
+          ).changes;
+      }
+
+      if (supersedeJobIds.length > 0) {
+        const placeholders = supersedeJobIds.map(() => "?").join(", ");
+        this.database
+          .prepare(
+            `UPDATE turn_jobs
+             SET status = 'cancelled', holder = NULL, finished_at = ?,
+                 updated_at = ?, last_error = ?
+             WHERE status IN ('pending', 'failed', 'interrupted')
+               AND id IN (${placeholders})`
+          )
+          .run(
+            now,
+            now,
+            supersedeError.slice(0, 2_000),
+            ...supersedeJobIds
+          );
+      }
+
+      return { updated: true, inserted, retargeted };
+    })();
+  }
+
   public getRetryableTurn(scopeKey: string, id?: string): TurnJobRecord | undefined {
     const row = this.database
       .prepare(
-        `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+        `SELECT id, event_id, scope_key, lane_key, target_json, message_json, prompt,
                 status, created_at
          FROM turn_jobs
-         WHERE scope_key = ? AND status = 'failed'
-           AND last_error LIKE 'session_busy:%'
+           WHERE scope_key = ?
+           AND status IN ('failed', 'interrupted')
+           AND (
+             last_error LIKE 'session_busy:%'
+             OR (target_json IS NOT NULL AND target_json LIKE '%\"conflictId\"%')
+           )
            AND (? IS NULL OR id = ?)
          ORDER BY updated_at DESC, rowid DESC LIMIT 1`
       )
@@ -742,7 +1139,7 @@ export class SqliteStateStore implements StateRepository {
     return this.database.transaction(() => {
       const first = this.database
         .prepare(
-          `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+          `SELECT id, event_id, scope_key, lane_key, target_json, message_json, prompt,
                   status, created_at
            FROM turn_jobs
            WHERE status = 'pending' AND lane_key = ? AND scope_key = ?
@@ -754,7 +1151,7 @@ export class SqliteStateStore implements StateRepository {
       }
       const rows = this.database
         .prepare(
-          `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+          `SELECT id, event_id, scope_key, lane_key, target_json, message_json, prompt,
                   status, created_at
            FROM turn_jobs
            WHERE status = 'pending' AND lane_key = ? AND scope_key = ?
@@ -803,7 +1200,7 @@ export class SqliteStateStore implements StateRepository {
     return this.database.transaction(() => {
       const rows = this.database
         .prepare(
-          `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+          `SELECT id, event_id, scope_key, lane_key, target_json, message_json, prompt,
                   status, created_at
            FROM turn_jobs WHERE scope_key = ? AND status = 'pending'
            ORDER BY created_at ASC`
@@ -823,7 +1220,7 @@ export class SqliteStateStore implements StateRepository {
     return (
       this.database
         .prepare(
-          `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+          `SELECT id, event_id, scope_key, lane_key, target_json, message_json, prompt,
                   status, created_at
            FROM turn_jobs WHERE scope_key = ? AND status = 'pending'
            ORDER BY created_at ASC LIMIT ?`
@@ -845,7 +1242,7 @@ export class SqliteStateStore implements StateRepository {
     return this.database.transaction(() => {
       const rows = this.database
         .prepare(
-          `SELECT id, event_id, scope_key, lane_key, message_json, prompt,
+          `SELECT id, event_id, scope_key, lane_key, target_json, message_json, prompt,
                   status, created_at
            FROM turn_jobs WHERE status = 'running' ORDER BY created_at ASC`
         )
@@ -860,6 +1257,252 @@ export class SqliteStateStore implements StateRepository {
         .run(now, now);
       return rows.map(turnJob);
     })();
+  }
+
+  public saveSessionConflict(record: SessionConflictRecord): void {
+    this.database
+      .prepare(
+        `INSERT INTO session_conflicts(
+           id, token, scope_key, chat_id, operator_open_id, run_id,
+           job_ids_json, target_json, state, choice, attempts,
+           next_attempt_at, expires_at, card_message_id, holder,
+           lease_expires_at, last_error, created_at, updated_at, resolved_at
+         ) VALUES(
+           @id, @token, @scopeKey, @chatId, @operatorOpenId, @runId,
+           @jobIdsJson, @targetJson, @state, @choice, @attempts,
+           @nextAttemptAt, @expiresAt, @cardMessageId, @holder,
+           @leaseExpiresAt, @lastError, @createdAt, @updatedAt, @resolvedAt
+         )
+         ON CONFLICT(id) DO UPDATE SET
+           job_ids_json = excluded.job_ids_json,
+           target_json = excluded.target_json,
+           state = excluded.state,
+           choice = excluded.choice,
+           attempts = excluded.attempts,
+           next_attempt_at = excluded.next_attempt_at,
+           expires_at = excluded.expires_at,
+           card_message_id = excluded.card_message_id,
+           holder = excluded.holder,
+           lease_expires_at = excluded.lease_expires_at,
+           last_error = excluded.last_error,
+           updated_at = excluded.updated_at,
+           resolved_at = excluded.resolved_at
+         WHERE session_conflicts.token = excluded.token`
+      )
+      .run({
+        id: record.id,
+        token: record.token,
+        scopeKey: record.scopeKey,
+        chatId: record.chatId,
+        operatorOpenId: record.operatorOpenId,
+        runId: record.runId,
+        jobIdsJson: JSON.stringify(record.jobIds),
+        targetJson: JSON.stringify(record.target),
+        state: record.state,
+        choice: record.choice ?? null,
+        attempts: record.attempts,
+        nextAttemptAt: record.nextAttemptAt ?? null,
+        expiresAt: record.expiresAt,
+        cardMessageId: record.cardMessageId ?? null,
+        holder: record.holder ?? null,
+        leaseExpiresAt: record.leaseExpiresAt ?? null,
+        lastError: record.lastError ?? null,
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        resolvedAt: record.resolvedAt ?? null
+      });
+  }
+
+  public getSessionConflict(id: string): SessionConflictRecord | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT id, token, scope_key, chat_id, operator_open_id, run_id,
+                job_ids_json, target_json, state, choice, attempts,
+                next_attempt_at, expires_at, card_message_id, holder,
+                lease_expires_at, last_error, created_at, updated_at, resolved_at
+         FROM session_conflicts WHERE id = ?`
+      )
+      .get(id) as SessionConflictRow | undefined;
+    return row ? sessionConflict(row) : undefined;
+  }
+
+  public listSessionConflicts(
+    states: readonly SessionConflictState[]
+  ): SessionConflictRecord[] {
+    if (states.length === 0) {
+      return [];
+    }
+    const placeholders = states.map(() => "?").join(", ");
+    return (
+      this.database
+        .prepare(
+          `SELECT id, token, scope_key, chat_id, operator_open_id, run_id,
+                  job_ids_json, target_json, state, choice, attempts,
+                  next_attempt_at, expires_at, card_message_id, holder,
+                  lease_expires_at, last_error, created_at, updated_at, resolved_at
+           FROM session_conflicts
+           WHERE state IN (${placeholders})
+           ORDER BY updated_at ASC, rowid ASC`
+        )
+        .all(...states) as SessionConflictRow[]
+    ).map(sessionConflict);
+  }
+
+  public getOpenSessionConflict(
+    scopeKey: string,
+    now = Date.now()
+  ): SessionConflictRecord | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT id, token, scope_key, chat_id, operator_open_id, run_id,
+                job_ids_json, target_json, state, choice, attempts,
+                next_attempt_at, expires_at, card_message_id, holder,
+                lease_expires_at, last_error, created_at, updated_at, resolved_at
+          FROM session_conflicts
+          WHERE scope_key = ?
+            AND state IN ('pending', 'waiting', 'branching', 'retrying')
+            AND (state = 'retrying' OR expires_at > ?)
+          ORDER BY updated_at DESC, rowid DESC LIMIT 1`
+      )
+      .get(scopeKey, now) as SessionConflictRow | undefined;
+    return row ? sessionConflict(row) : undefined;
+  }
+
+  public claimSessionConflict(
+    id: string,
+    token: string,
+    operatorOpenId: string,
+    chatId: string,
+    scopeKey: string,
+    choice: SessionConflictChoice,
+    now: number,
+    cardMessageId?: string
+  ): SessionConflictRecord | undefined {
+    const state: SessionConflictState =
+      choice === "wait" ? "waiting" : choice === "branch" ? "branching" : "cancelled";
+    const result = this.database
+      .prepare(
+        `UPDATE session_conflicts
+         SET state = ?, choice = ?, card_message_id = COALESCE(?, card_message_id), updated_at = ?,
+             resolved_at = CASE WHEN ? = 'cancel' THEN ? ELSE resolved_at END,
+             holder = NULL, lease_expires_at = NULL
+         WHERE id = ? AND token = ? AND operator_open_id = ?
+           AND chat_id = ? AND scope_key = ? AND state = 'pending'
+           AND expires_at > ?`
+      )
+      .run(
+        state,
+        choice,
+        cardMessageId ?? null,
+        now,
+        choice,
+        now,
+        id,
+        token,
+        operatorOpenId,
+        chatId,
+        scopeKey,
+        now
+      );
+    if (result.changes !== 1) {
+      return undefined;
+    }
+    return this.getSessionConflict(id);
+  }
+
+  public updateSessionConflict(
+    id: string,
+    patch: SessionConflictPatch,
+    now: number,
+    expectedStates?: readonly SessionConflictState[]
+  ): boolean {
+    const assignments: string[] = [];
+    const values: unknown[] = [];
+    if (patch.state !== undefined) {
+      assignments.push("state = ?");
+      values.push(patch.state);
+    }
+    if (patch.choice !== undefined) {
+      assignments.push("choice = ?");
+      values.push(patch.choice);
+    }
+    if (patch.attempts !== undefined) {
+      assignments.push("attempts = ?");
+      values.push(patch.attempts);
+    }
+    if (patch.nextAttemptAt !== undefined) {
+      assignments.push("next_attempt_at = ?");
+      values.push(patch.nextAttemptAt);
+    }
+    if (patch.cardMessageId !== undefined) {
+      assignments.push("card_message_id = ?");
+      values.push(patch.cardMessageId);
+    }
+    if (patch.holder !== undefined) {
+      assignments.push("holder = ?");
+      values.push(patch.holder);
+    }
+    if (patch.leaseExpiresAt !== undefined) {
+      assignments.push("lease_expires_at = ?");
+      values.push(patch.leaseExpiresAt);
+    }
+    if (patch.lastError !== undefined) {
+      assignments.push("last_error = ?");
+      values.push(patch.lastError?.slice(0, 2_000) ?? null);
+    }
+    if (patch.resolvedAt !== undefined) {
+      assignments.push("resolved_at = ?");
+      values.push(patch.resolvedAt);
+    }
+    assignments.push("updated_at = ?");
+    values.push(now);
+    values.push(id);
+    const stateFilter = expectedStates?.length
+      ? ` AND state IN (${expectedStates.map(() => "?").join(", ")})`
+      : "";
+    if (expectedStates?.length) {
+      values.push(...expectedStates);
+    }
+    return this.database
+      .prepare(
+        `UPDATE session_conflicts SET ${assignments.join(", ")} WHERE id = ?${stateFilter}`
+      )
+      .run(...values).changes === 1;
+  }
+
+  public rotateSessionConflictToken(
+    id: string,
+    expectedToken: string,
+    nextToken: string,
+    now: number
+  ): boolean {
+    return this.database
+      .prepare(
+        `UPDATE session_conflicts
+         SET token = ?, updated_at = ?
+         WHERE id = ? AND token = ?
+           AND state IN ('pending', 'waiting', 'branching', 'retrying')`
+      )
+      .run(nextToken, now, id, expectedToken).changes === 1;
+  }
+
+  public listTurnJobsByConflict(
+    scopeKey: string,
+    conflictId: string
+  ): TurnJobRecord[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT id, event_id, scope_key, lane_key, target_json, message_json, prompt,
+                  status, created_at
+           FROM turn_jobs
+           WHERE scope_key = ? AND target_json IS NOT NULL
+           ORDER BY created_at ASC, rowid ASC`
+        )
+        .all(scopeKey) as TurnJobRow[]
+    )
+      .map(turnJob)
+      .filter((job) => job.target?.conflictId === conflictId);
   }
 
   public saveLiveCard(record: LiveCardRecord): void {
@@ -1071,15 +1714,16 @@ export class SqliteStateStore implements StateRepository {
       this.database
         .prepare(
           `UPDATE delivery_outbox
-           SET status = 'superseded', updated_at = ?,
+           SET status = 'superseded', holder = NULL, lease_expires_at = NULL, updated_at = ?,
                last_error = '已被更新版本替代。'
-           WHERE status = 'pending' AND target_key IS NOT NULL
-             AND revision < (
-               SELECT latest.revision FROM delivery_target_versions AS latest
-               WHERE latest.target_key = delivery_outbox.target_key
-             )`
+           WHERE target_key IS NOT NULL
+             AND (
+               status = 'pending' OR
+               (status = 'processing' AND lease_expires_at <= ?)
+             )
+             AND ${deliveryIsStale}`
         )
-        .run(now);
+        .run(now, now);
       const row = this.database
         .prepare(
           `SELECT id, idempotency_key, target_json, card_json, attempts,
@@ -1090,6 +1734,7 @@ export class SqliteStateStore implements StateRepository {
              status = 'pending' OR
              (status = 'processing' AND lease_expires_at <= ?)
            )
+             AND ${deliveryLatestMatch}
            ORDER BY id ASC LIMIT 1`
         )
         .get(now, now) as DeliveryRow | undefined;
@@ -1104,7 +1749,8 @@ export class SqliteStateStore implements StateRepository {
            WHERE id = ? AND (
              status = 'pending' OR
              (status = 'processing' AND lease_expires_at <= ?)
-           )`
+           )
+             AND ${deliveryLatestMatch}`
         )
         .run(holder, now + ttlMs, now, row.id, now);
       return result.changes === 1
@@ -1113,15 +1759,22 @@ export class SqliteStateStore implements StateRepository {
     })();
   }
 
-  public completeDelivery(id: number, holder: string, now: number): void {
-    this.database
+  public completeDelivery(id: number, holder: string, now: number): boolean {
+    const row = this.database
       .prepare(
         `UPDATE delivery_outbox
-         SET status = 'sent', holder = NULL, lease_expires_at = NULL,
-             sent_at = ?, updated_at = ?
-         WHERE id = ? AND holder = ?`
+         SET status = CASE WHEN ${deliveryLatestMatch}
+               THEN 'sent' ELSE 'superseded' END,
+             last_error = CASE WHEN ${deliveryLatestMatch}
+               THEN last_error ELSE '已被更新版本替代。' END,
+             holder = NULL, lease_expires_at = NULL,
+             sent_at = CASE WHEN ${deliveryLatestMatch} THEN ? ELSE sent_at END,
+             updated_at = ?
+         WHERE id = ? AND holder = ?
+         RETURNING status`
       )
-      .run(now, now, id, holder);
+      .get(now, now, id, holder) as { status: "sent" | "superseded" } | undefined;
+    return row?.status === "sent";
   }
 
   public retryDelivery(
@@ -1134,13 +1787,8 @@ export class SqliteStateStore implements StateRepository {
     this.database
       .prepare(
         `UPDATE delivery_outbox
-         SET status = CASE
-               WHEN target_key IS NOT NULL AND revision < (
-                 SELECT latest.revision FROM delivery_target_versions AS latest
-                 WHERE latest.target_key = delivery_outbox.target_key
-               ) THEN 'superseded'
-               ELSE 'pending'
-             END,
+         SET status = CASE WHEN ${deliveryLatestMatch}
+               THEN 'pending' ELSE 'superseded' END,
              holder = NULL, lease_expires_at = NULL,
              attempts = ?, retry_at = ?, last_error = ?, updated_at = ?
          WHERE id = ? AND holder = ?`
@@ -1158,11 +1806,15 @@ export class SqliteStateStore implements StateRepository {
     this.database
       .prepare(
         `UPDATE delivery_outbox
-         SET status = 'failed', holder = NULL, lease_expires_at = NULL,
-             attempts = ?, last_error = ?, updated_at = ?
+         SET status = CASE WHEN ${deliveryLatestMatch}
+               THEN 'failed' ELSE 'superseded' END,
+             last_error = CASE WHEN ${deliveryLatestMatch}
+               THEN ? ELSE '已被更新版本替代。' END,
+             holder = NULL, lease_expires_at = NULL,
+             attempts = ?, updated_at = ?
          WHERE id = ? AND holder = ?`
       )
-      .run(attempts, error.slice(0, 2_000), now, id, holder);
+      .run(error.slice(0, 2_000), attempts, now, id, holder);
   }
 
   public savePendingAction(record: PendingActionRecord, now: number): void {

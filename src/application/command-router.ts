@@ -1,18 +1,21 @@
 import { basename } from "node:path";
-import type { InboundMessage } from "../contracts/events.js";
+import type { AgentHealth, InboundMessage } from "../contracts/events.js";
 import {
   commandHelp,
   looksLikeCommand,
   parseRegisteredCommand,
-  registeredCommandAction
+  registeredCommandAction,
+  sessionConflictActions
 } from "../domain/command-registry.js";
 import type { TurnControl } from "../domain/turn-queue.js";
+import type { SessionConflictRecord } from "../contracts/session-routing.js";
 import type { CodingAgent } from "../ports/coding-agent.js";
 import type { RunRecord, StateRepository } from "../ports/state-repository.js";
 import { errorMessage } from "../observability/logger.js";
 import type { ActionApprovalContext } from "./lark-action-service.js";
 import type { ControlCenterService } from "./control-center-service.js";
 import type { PresentationOptions } from "./presentation-factory.js";
+import type { CodexProject } from "./project-catalog-service.js";
 import type { ProjectNavigationService } from "./project-navigation-service.js";
 import type { SessionCatalogService } from "./session-catalog-service.js";
 
@@ -94,6 +97,11 @@ export class CommandRouter {
     }
     const command = parsed.definition.id;
     if (command === "retry") {
+      const conflict = this.store.getOpenSessionConflict(context.scopeKey);
+      if (conflict) {
+        await this.replyConflictBlocked(context, conflict);
+        return true;
+      }
       try {
         const pending = await this.turns.retry(context.scopeKey, parsed.args.trim() || undefined);
         await context.reply(`原消息已重新进入执行队列，当前等待 ${pending} 条。`, {
@@ -145,6 +153,11 @@ export class CommandRouter {
     }
 
     if (command === "sessions") {
+      const conflict = this.store.getOpenSessionConflict(scopeKey);
+      if (conflict) {
+        await this.replyConflictBlocked(context, conflict);
+        return true;
+      }
       const project = await this.sessions.selectedProject(scopeKey);
       if (!project) {
         const view = await this.navigation.projects(scopeKey);
@@ -261,6 +274,11 @@ export class CommandRouter {
           tone: "warning",
           status: "操作无效"
         });
+        return true;
+      }
+      const conflict = this.store.getOpenSessionConflict(scopeKey);
+      if (conflict) {
+        await this.replyConflictBlocked(context, conflict);
         return true;
       }
       const project = await this.sessions.selectedProject(scopeKey);
@@ -405,19 +423,49 @@ export class CommandRouter {
     }
 
     if (command === "status") {
-      const project = await this.sessions.selectedProject(scopeKey);
+      const conflict = this.store.getOpenSessionConflict(scopeKey);
       const link = this.store.getConversation(scopeKey);
+      const persistedCwd = this.store.getProject(scopeKey) ?? link?.cwd;
+      let project: CodexProject | undefined;
+      let projectLookupFailed = false;
+      if (!conflict) {
+        try {
+          project = await this.sessions.selectedProject(scopeKey);
+        } catch {
+          projectLookupFailed = true;
+        }
+      }
       const newSessionIntent = this.store.getNewSessionIntent(scopeKey);
       const targetReady = Boolean(link || newSessionIntent);
+      const projectReady = Boolean(project || persistedCwd);
       const queue = this.turns.snapshot(scopeKey);
       const running = queue.active || this.agent.activeScopes().includes(scopeKey);
       const latestRun = this.store.getLatestRun(scopeKey);
-      const health = this.agent.health
-        ? await this.agent.health()
+      // A conflict status card must remain renderable when the external
+      // writer is unavailable. Skip the live health probe in that branch;
+      // for normal status requests, degrade the probe failure to a warning
+      // card instead of failing the inbound event without a reply.
+      let health: AgentHealth = conflict
+        ? { backend: "exec" as const, ready: true, detail: "会话占用选择期间暂不探测后端。" }
         : { backend: "exec" as const, ready: true, detail: "兼容 Exec 后端" };
+      if (!conflict && this.agent.health) {
+        try {
+          health = await this.agent.health();
+        } catch (error) {
+          health = {
+            backend: "exec",
+            ready: false,
+            detail: `后端探测失败：${errorMessage(error)}`
+          };
+        }
+      }
       await context.reply(
-        !project
+        conflict
+          ? "上一条消息正在等待会话占用选择，请先选择等待原会话或创建独立会话。"
+          : !projectReady
           ? "当前尚未选择项目，普通消息不会执行。"
+          : projectLookupFailed
+            ? "项目目录已记录，但 Codex 项目索引暂时不可用；可先处理当前会话占用或稍后刷新。"
           : !targetReady
             ? "项目已经选择，但还需要选择历史会话或明确新建会话。"
           : running
@@ -428,9 +476,13 @@ export class CommandRouter {
         {
           title: "运行状态",
           kind: "status",
-          tone: !project || !targetReady || !health.ready ? "warning" : running ? "warning" : "success",
-          status: !project
+          tone: conflict || projectLookupFailed || !projectReady || !targetReady || !health.ready ? "warning" : running ? "warning" : "success",
+          status: conflict
+            ? "等待占用选择"
+            : !projectReady
             ? "未选择项目"
+            : projectLookupFailed
+              ? "目录索引不可用"
             : !targetReady
               ? "未选择会话"
               : running
@@ -439,8 +491,8 @@ export class CommandRouter {
                   ? "空闲"
                   : "后端不可用",
           fields: [
-            { label: "当前项目", value: project?.name ?? "未选择" },
-            { label: "项目目录", value: project?.cwd ?? "—" },
+            { label: "当前项目", value: project?.name ?? (persistedCwd ? basename(persistedCwd) || persistedCwd : "未选择") },
+            { label: "项目目录", value: project?.cwd ?? persistedCwd ?? "—" },
             {
               label: "Codex 会话",
               value: link?.sessionId ?? (newSessionIntent ? "等待新建" : "尚未选择")
@@ -448,18 +500,33 @@ export class CommandRouter {
             { label: "执行后端", value: health.backend },
             { label: "最近执行", value: runStateLabel(latestRun) },
             { label: "排队消息", value: String(queue.pending) },
+            ...(conflict
+              ? [
+                  {
+                    label: "占用目标",
+                    value: `${conflict.target.sessionId.slice(0, 12)}… · ${Math.max(1, Math.ceil((conflict.expiresAt - Date.now()) / 60_000))} 分钟内有效`
+                  }
+                ]
+              : []),
             { label: "诊断", value: health.detail }
           ],
-          actions: [
-            registeredCommandAction("刷新", "status", "", "primary"),
-            project
-              ? registeredCommandAction("项目会话", "sessions")
-              : registeredCommandAction("选择项目", "projects", "", "primary"),
-            registeredCommandAction("消息队列", "queue"),
-            ...(running || queue.pending > 0
-              ? [registeredCommandAction("停止任务", "cancel", "", "danger")]
-              : [registeredCommandAction("控制中心", "help")])
-          ]
+          actions: conflict
+            ? sessionConflictActions(conflict)
+            : [
+                registeredCommandAction("刷新", "status", "", "primary"),
+                project
+                  ? registeredCommandAction("项目会话", "sessions")
+                  : registeredCommandAction(
+                      persistedCwd ? "刷新项目" : "选择项目",
+                      "projects",
+                      "",
+                      "primary"
+                    ),
+                registeredCommandAction("消息队列", "queue"),
+                ...(running || queue.pending > 0
+                  ? [registeredCommandAction("停止任务", "cancel", "", "danger")]
+                  : [registeredCommandAction("控制中心", "help")])
+              ]
         }
       );
       return true;
@@ -540,6 +607,11 @@ export class CommandRouter {
   }
 
   private async canSwitch(context: CommandContext): Promise<boolean> {
+    const conflict = this.store.getOpenSessionConflict(context.scopeKey);
+    if (conflict) {
+      await this.replyConflictBlocked(context, conflict);
+      return false;
+    }
     const queue = this.turns.snapshot(context.scopeKey);
     if (!queue.active && queue.pending === 0) {
       return true;
@@ -550,6 +622,22 @@ export class CommandRouter {
       status: "任务执行中"
     });
     return false;
+  }
+
+  private async replyConflictBlocked(
+    context: CommandContext,
+    conflict: SessionConflictRecord
+  ): Promise<void> {
+    await context.reply("请先处理会话占用卡片，再执行重试、暂存消息或切换操作。", {
+      title: "请先处理会话占用",
+      tone: "warning",
+      status: "等待占用选择",
+      fields: [
+        { label: "工作目录", value: conflict.target.cwd },
+        { label: "目标会话", value: conflict.target.sessionId }
+      ],
+      actions: sessionConflictActions(conflict)
+    });
   }
 
   private async replyError(

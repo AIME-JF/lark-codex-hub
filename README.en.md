@@ -2,7 +2,7 @@
 
 [中文](README.md) · [Feishu setup](docs/FEISHU_SETUP.md) · [Operations](docs/OPERATIONS.md) · [Architecture](ARCHITECTURE.md)
 
-![version](https://img.shields.io/badge/version-1.5.0-3370ff)
+![version](https://img.shields.io/badge/version-1.6.0-3370ff)
 ![platform](https://img.shields.io/badge/platform-Windows-0078d4)
 ![node](https://img.shields.io/badge/Node.js-%3E%3D22.12-339933)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -96,7 +96,7 @@ node .\dist\cli\index.js setup --from-env `
 Remove-Item Env:LARK_APP_ID, Env:LARK_APP_SECRET
 ```
 
-Credentials are encrypted with current-user Windows DPAPI. If `lark-cli` is not installed, set `larkCli.enabled` to `false` in `%USERPROFILE%\.lark-codex-hub\config.v5.json`.
+Credentials are encrypted with current-user Windows DPAPI. If `lark-cli` is not installed, set `larkCli.enabled` to `false` in `%USERPROFILE%\.lark-codex-hub\config.v6.json`.
 
 The recyclable App Server backend is the default. Hub keeps it only while needed and closes the child process after the final active Feishu turn to release cross-client writer ownership. Set `codex.backend` to `exec` only as an explicit compatibility fallback.
 
@@ -152,7 +152,7 @@ The default state directory is `%USERPROFILE%\.lark-codex-hub`:
 
 | Path | Purpose |
 | --- | --- |
-| `config.v5.json` | Non-secret policy and runtime configuration |
+| `config.v6.json` | Non-secret policy and runtime configuration |
 | `secrets.v2.json` | Current-user DPAPI-encrypted app credentials |
 | `hub.sqlite*` | Sessions, queues, leases, runs, and approvals |
 | `logs\hub.log*` | Rotating structured logs with redaction |
@@ -177,7 +177,7 @@ Read [Security Policy](SECURITY.md) for the full threat model and reporting guid
 
 - The Codex App Server command and protocol can evolve with Codex CLI releases; run `doctor` after upgrading Codex CLI.
 - Desktop, VS Code, CLI, and Hub share persisted Codex history, not a real-time mirrored interface; thread lists may need a refresh.
-- A thread can have only one App Server writer at a time. When a local client owns it, Feishu reports the busy state and never silently creates a replacement thread.
+- A thread can have only one App Server writer at a time. When a local client owns it, Feishu shows a durable A/B card: wait for the original thread to be released, or create a blank independent session in the same project. While the lock remains, the same card is updated instead of sending repeated prompts. The Hub never silently redirects a request.
 - Hub recycles its App Server after the final Feishu turn so another Codex client can resume the thread.
 - A forcibly interrupted Codex run is not automatically replayed because it may already have changed files.
 - Feishu image and file attachments are not currently passed to Codex.

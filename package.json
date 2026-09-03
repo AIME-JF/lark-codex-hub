@@ -1,6 +1,6 @@
 {
   "name": "@aime-jf/lark-codex-hub",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "A secure Feishu control plane for Codex App Server",
   "type": "module",
   "private": false,
